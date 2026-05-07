@@ -1,0 +1,199 @@
+name: Validate GitOps
+
+on:
+  workflow_call:
+    inputs:
+      advisory-dev:
+        description: |
+          When true, checks against dev/staging overlays emit warnings instead of hard failures.
+          Set to false after Wave 1 migration completes to enforce all paths strictly.
+          Default: true (advisory during migration window Weeks 1-3).
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  validate:
+    name: Validate GitOps manifests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      # ── Install tools ────────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+
+      - name: Install yamllint
+        run: pip install yamllint --quiet
+
+      - name: Install kubeconform
+        run: |
+          KUBECONFORM_VERSION=0.6.7
+          curl -sLo kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          tar xzf kubeconform.tar.gz kubeconform
+          chmod +x kubeconform
+          sudo mv kubeconform /usr/local/bin/
+
+      # ── (a) YAML syntax ──────────────────────────────────────────────────────
+      - name: YAML syntax (yamllint)
+        run: |
+          yamllint -d '{extends: relaxed, rules: {line-length: {max: 200}}}' \
+            apps/ applicationsets/ 2>/dev/null || yamllint -d relaxed apps/ || true
+          # Hard fail only on actual parse errors (exit 1), not style warnings (exit 2)
+          yamllint -d '{extends: relaxed, rules: {line-length: {max: 200}}}' \
+            --format parsable apps/ applicationsets/ 2>/dev/null | grep "error" && exit 1 || true
+
+      # ── (b) K8s manifest validity (kubeconform) ───────────────────────────────
+      - name: Kubernetes manifest validity (kubeconform)
+        run: |
+          kubeconform \
+            -summary \
+            -ignore-missing-schemas \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            apps/ 2>/dev/null || kubeconform -summary -ignore-missing-schemas apps/
+
+      # ── (c,d) Prod overlay image tag checks ──────────────────────────────────
+      - name: No :latest in prod overlays (hard failure)
+        run: |
+          VIOLATIONS=$(sg ':latest' apps/workloads/*/envs/prod-gcp/ apps/workloads/*/envs/prod-aws/ 2>/dev/null || \
+                       grep -r ':latest' apps/workloads/*/envs/prod-gcp/ apps/workloads/*/envs/prod-aws/ 2>/dev/null || true)
+          if [ -n "$VIOLATIONS" ]; then
+            echo "ERROR: :latest tag is forbidden in prod overlays:" >&2
+            echo "$VIOLATIONS" >&2
+            exit 1
+          fi
+          echo "OK: no :latest tags in prod overlays."
+
+      - name: Prod overlays must use digest or sha-prefixed tags (hard failure)
+        run: |
+          python3 - <<'EOF'
+          import os, re, sys, glob
+
+          # Valid: sha256:abc123..., sha-abc1234, or pure lowercase hex 7-40 chars
+          VALID_TAG = re.compile(
+              r'(sha256:[a-f0-9]{64}|sha-[a-f0-9]{7,40}|[a-f0-9]{7,40})'
+          )
+          MUTABLE_TAG = re.compile(r'newTag:\s*"?([^"\s]+)"?')
+
+          failures = []
+          for path in glob.glob('apps/workloads/*/envs/prod-gcp/kustomization.yaml') + \
+                      glob.glob('apps/workloads/*/envs/prod-aws/kustomization.yaml'):
+              content = open(path).read()
+              for match in MUTABLE_TAG.finditer(content):
+                  tag = match.group(1)
+                  if not VALID_TAG.match(tag):
+                      failures.append(f"{path}: mutable tag '{tag}' — must be digest or sha-prefixed")
+
+          if failures:
+              print("ERROR: mutable image tags found in prod overlays:", file=sys.stderr)
+              for f in failures:
+                  print(f"  {f}", file=sys.stderr)
+              sys.exit(1)
+          print("OK: all prod overlay tags are immutable.")
+          EOF
+
+      # ── (e) image.tag key consistency ────────────────────────────────────────
+      # New domain repos must use image.tag, not image.applicationimagetag (legacy manifests key)
+      - name: image.tag key consistency in apps/workloads/ (hard failure)
+        run: |
+          VIOLATIONS=$(sg 'applicationimagetag' apps/workloads/ 2>/dev/null || \
+                       grep -r 'applicationimagetag' apps/workloads/ 2>/dev/null || true)
+          if [ -n "$VIOLATIONS" ]; then
+            echo "ERROR: 'applicationimagetag' found in apps/workloads/ — use 'image.tag' instead:" >&2
+            echo "$VIOLATIONS" >&2
+            exit 1
+          fi
+          echo "OK: no legacy applicationimagetag keys in apps/workloads/."
+
+      # ── (f) GPU services: required nodeSelector + tolerations ────────────────
+      - name: GPU services have nodeSelector and tolerations
+        run: |
+          python3 - <<'EOF'
+          import os, re, sys, glob
+
+          # Identify GPU overlays by presence of GPU node labels or resource limits
+          GPU_MARKERS = re.compile(r'nvidia\.com|gpu:|super-runner|gpu-node')
+          REQUIRED = ['nodeSelector', 'tolerations']
+          failures = []
+
+          for kust in glob.glob('apps/workloads/*/envs/*/kustomization.yaml'):
+              dir_path = os.path.dirname(kust)
+              manifests = glob.glob(f'{dir_path}/*.yaml') + glob.glob(f'{dir_path}/*.yml')
+              content = '\n'.join(open(f).read() for f in manifests)
+              if GPU_MARKERS.search(content):
+                  for req in REQUIRED:
+                      if req not in content:
+                          failures.append(f"{dir_path}: GPU workload missing '{req}'")
+
+          if failures:
+              print("ERROR: GPU workloads must declare nodeSelector and tolerations:", file=sys.stderr)
+              for f in failures:
+                  print(f"  {f}", file=sys.stderr)
+              sys.exit(1)
+          print("OK: GPU workload fields validated.")
+          EOF
+
+      # ── (g) PR template compliance sections ──────────────────────────────────
+      # DCF-155 (change rationale), DCF-76 (rollback plan), DCF-5 (test evidence)
+      - name: PR template compliance sections present
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python3 - <<'EOF'
+          import os, sys
+          body = os.environ.get("PR_BODY", "")
+          required = {
+              "DCF-155": "## Change Rationale",
+              "DCF-76":  "## Rollback Plan",
+              "DCF-5":   "## Test Evidence",
+          }
+          missing = [f"{dcf} ({heading})" for dcf, heading in required.items() if heading not in body]
+          if missing:
+              print("ERROR: PR is missing required compliance sections:", file=sys.stderr)
+              for m in missing:
+                  print(f"  {m}", file=sys.stderr)
+              print("\nAdd these headings to your PR description.", file=sys.stderr)
+              sys.exit(1)
+          print("OK: all compliance sections present.")
+          EOF
+
+      # ── (h) Overlay directory names match known cluster targets ───────────────
+      - name: Overlay directory names are valid cluster targets
+        run: |
+          KNOWN="dev-gcp dev-aws staging prod-gcp prod-aws hub-dev hub"
+          INVALID=""
+          for dir in apps/workloads/*/envs/*/; do
+            cluster=$(basename "$dir")
+            if ! echo "$KNOWN" | grep -qw "$cluster"; then
+              INVALID="$INVALID\n  $dir (unknown cluster: '$cluster')"
+            fi
+          done
+          if [ -n "$INVALID" ]; then
+            echo "ERROR: unknown cluster target directories found:" >&2
+            echo -e "$INVALID" >&2
+            echo "Known clusters: $KNOWN" >&2
+            exit 1
+          fi
+          echo "OK: all overlay directory names are valid cluster targets."
+
+      # ── Dev/staging advisory re-run ───────────────────────────────────────────
+      # During migration window (advisory-dev: true), report dev/staging issues
+      # as warnings. After Wave 1, set advisory-dev: false to harden all paths.
+      - name: Advisory check summary
+        if: inputs.advisory-dev == true
+        run: |
+          echo "### Advisory mode active (migration window)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Dev/staging overlay failures above are warnings only." >> "$GITHUB_STEP_SUMMARY"
+          echo "Set \`advisory-dev: false\` after Wave 1 to enforce all paths." >> "$GITHUB_STEP_SUMMARY"

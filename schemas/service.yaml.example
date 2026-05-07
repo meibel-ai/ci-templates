@@ -1,0 +1,22 @@
+apiVersion: meibel.ai/v1
+kind: Service
+metadata:
+  name: my-service
+  team: platform
+spec:
+  tier: 1                        # 1=critical, 2=standard, 3=best-effort
+  repo: meibel-ai/my-service
+  language: python               # python | node | go | rust
+  runtime:
+    framework: standard          # standard | rayservice | kuberay
+    gpu: false
+  deployment:
+    targets:
+      - dev-gcp
+      - dev-aws
+      - prod-gcp
+      - prod-aws
+    progressive: false           # true enables Argo Rollouts; incompatible with rayservice
+  slos:
+    availability: 99.9
+    latency_p99_ms: 500
