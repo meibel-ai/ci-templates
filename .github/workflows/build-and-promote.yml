@@ -1,0 +1,357 @@
+name: Build and Promote
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: 'Service name — used for image name and gitops overlay path'
+        required: true
+        type: string
+      language:
+        description: 'Runtime language: python | node | go | rust'
+        required: true
+        type: string
+      runs-on:
+        description: 'Runner label: meibel-eks-dev (CPU) | super-runner (GPU)'
+        required: true
+        type: string
+      registry:
+        description: 'Container registry prefix'
+        required: false
+        type: string
+        default: 'ghcr.io/meibel-ai'
+      wif-provider:
+        description: |
+          Full WIF provider resource path.
+          Core pool: projects/502352286495/locations/global/workloadIdentityPools/meibel-ai-gh-wd-pool/providers/meibel-ai-gh-wd-pool-provider
+          Hub pool:  projects/1043014246178/locations/global/workloadIdentityPools/meibel-gh-wd-pool--um0j/providers/meibel-ai-gh-wd-pool-provider
+        required: false
+        type: string
+        default: 'projects/502352286495/locations/global/workloadIdentityPools/meibel-ai-gh-wd-pool/providers/meibel-ai-gh-wd-pool-provider'
+      cache-type:
+        description: 'Docker build cache backend: gha (default) | registry (GPU repos >10GB)'
+        required: false
+        type: string
+        default: 'gha'
+    secrets:
+      MEIBEL_DEPLOY_APP_ID:
+        required: true
+      MEIBEL_DEPLOY_APP_PRIVATE_KEY:
+        required: true
+
+jobs:
+  build-sign-promote:
+    name: Build, Sign & Promote
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      id-token: write       # WIF + Cosign keyless OIDC
+      contents: read
+      packages: write       # GHCR push
+      security-events: write # Trivy SARIF upload
+
+    steps:
+      # ── 0. Validate required inputs ──────────────────────────────────────────
+      - name: Validate language input
+        run: |
+          case "${{ inputs.language }}" in
+            python|node|go|rust) ;;
+            *)
+              echo "ERROR: 'language' must be one of: python, node, go, rust. Got: '${{ inputs.language }}'" >&2
+              exit 1
+              ;;
+          esac
+
+      # ── 1. Checkout + read ci-config.yaml overrides ──────────────────────────
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Read ci-config.yaml overrides
+        id: ci-config
+        run: |
+          SKIP_TESTS=false
+          if [ -f ci-config.yaml ]; then
+            SKIP_TESTS=$(python3 -c "
+          import yaml, sys
+          d = yaml.safe_load(open('ci-config.yaml'))
+          print(str(d.get('skip-tests', False)).lower())
+          " 2>/dev/null || echo false)
+          fi
+
+          # Detect whether test files exist so test steps are no-ops on repos with none
+          HAS_TESTS=true
+          case "${{ inputs.language }}" in
+            python)
+              [ -z "$(find . -name 'test_*.py' -o -name '*_test.py' 2>/dev/null | head -1)" ] && HAS_TESTS=false
+              ;;
+            node)
+              [ -z "$(find . -name '*.test.js' -o -name '*.test.ts' -o -name '*.spec.js' -o -name '*.spec.ts' 2>/dev/null | head -1)" ] && HAS_TESTS=false
+              ;;
+            go)
+              [ -z "$(find . -name '*_test.go' 2>/dev/null | head -1)" ] && HAS_TESTS=false
+              ;;
+            rust)
+              HAS_TESTS=true  # cargo test exits cleanly with no test files
+              ;;
+          esac
+
+          echo "skip-tests=${SKIP_TESTS}" >> "$GITHUB_OUTPUT"
+          echo "has-tests=${HAS_TESTS}" >> "$GITHUB_OUTPUT"
+
+      # ── 2. GCP auth (WIF) — needed by Python for Artifact Registry deps ──────
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ inputs.wif-provider }}
+
+      # ── 2a. Python lint + tests ───────────────────────────────────────────────
+      - name: Set up Python
+        if: inputs.language == 'python'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+
+      - name: Install Poetry
+        if: inputs.language == 'python'
+        uses: snok/install-poetry@76e04a911780d5b312d89783f7b1cd627778900a # v1.4.1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Install Poetry GCP keyring plugin
+        if: inputs.language == 'python'
+        run: poetry self add keyrings.google-artifactregistry-auth
+
+      - name: Cache Poetry venv
+        if: inputs.language == 'python'
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-3.11-${{ hashFiles('**/poetry.lock') }}
+
+      - name: Install Python dependencies
+        if: inputs.language == 'python'
+        run: poetry install --no-interaction
+
+      - name: Python lint (ruff)
+        if: inputs.language == 'python'
+        run: poetry run ruff check .
+
+      - name: Python tests (pytest)
+        if: |
+          inputs.language == 'python' &&
+          steps.ci-config.outputs.skip-tests != 'true' &&
+          steps.ci-config.outputs.has-tests == 'true'
+        run: poetry run pytest tests/ -v --tb=short
+
+      # ── 2b. Node lint + tests ─────────────────────────────────────────────────
+      - name: Set up Node
+        if: inputs.language == 'node'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Node dependencies
+        if: inputs.language == 'node'
+        run: npm ci
+
+      - name: Node lint (eslint)
+        if: inputs.language == 'node'
+        run: npx eslint .
+
+      - name: Node tests
+        if: |
+          inputs.language == 'node' &&
+          steps.ci-config.outputs.skip-tests != 'true' &&
+          steps.ci-config.outputs.has-tests == 'true'
+        run: npm test
+
+      # ── 2c. Go lint + tests ───────────────────────────────────────────────────
+      - name: Set up Go
+        if: inputs.language == 'go'
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Go lint (golangci-lint)
+        if: inputs.language == 'go'
+        uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9 # v8.0.0
+        with:
+          version: latest
+
+      - name: Go tests
+        if: |
+          inputs.language == 'go' &&
+          steps.ci-config.outputs.skip-tests != 'true' &&
+          steps.ci-config.outputs.has-tests == 'true'
+        run: go test ./...
+
+      # ── 2d. Rust lint + tests ─────────────────────────────────────────────────
+      - name: Rust lint (clippy)
+        if: inputs.language == 'rust'
+        run: cargo clippy -- -D warnings
+
+      - name: Rust supply chain check (cargo-deny)
+        if: inputs.language == 'rust'
+        uses: EmbarkStudios/cargo-deny-action@8d73959fce1cdc8989f23fdf03bec6ae6a6576ef # v2.0.7
+
+      - name: Rust tests
+        if: |
+          inputs.language == 'rust' &&
+          steps.ci-config.outputs.skip-tests != 'true'
+        run: cargo test
+
+      # ── 3. GitHub App token (GHCR login + gitops promote PR) ─────────────────
+      - name: Get GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          app-id: ${{ secrets.MEIBEL_DEPLOY_APP_ID }}
+          private-key: ${{ secrets.MEIBEL_DEPLOY_APP_PRIVATE_KEY }}
+          repositories: gitops-platform,${{ github.event.repository.name }}
+
+      # ── 4. Build container image with immutable digest tag ───────────────────
+      - name: Clean stale buildx state
+        run: docker buildx rm --all-inactive --force 2>/dev/null || true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          name: builder-${{ github.run_id }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ steps.app-token.outputs.token }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ${{ inputs.registry }}/${{ inputs.service-name }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=${{ inputs.cache-type }}
+          cache-to: type=${{ inputs.cache-type }},mode=max
+          secret-files: |
+            gcp_creds=${{ env.GOOGLE_APPLICATION_CREDENTIALS }}
+
+      # ── 5. Generate SBOM (Syft / SPDX, signed attestation) ───────────────────
+      - name: Generate SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ inputs.registry }}/${{ inputs.service-name }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: true
+          upload-release-assets: false
+
+      # ── 6. Trivy scan — HIGH/CRITICAL gate ────────────────────────────────────
+      - name: Scan image with Trivy
+        id: trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ inputs.registry }}/${{ inputs.service-name }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: '1'
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@28deaeda66b76a05916b6923827895f2b14ab387 # v3.28.16
+        with:
+          sarif_file: trivy-results.sarif
+
+      # ── 7. Cosign keyless sign (only on main, only if Trivy passed) ───────────
+      #
+      # The signing identity subject is THIS workflow file URL:
+      #   https://github.com/meibel-ai/ci-templates/.github/workflows/build-and-promote.yml
+      # Kyverno verifyImages policy must reference this path, not the caller's path.
+      - name: Install Cosign
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign image with Cosign keyless
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          cosign sign --yes \
+            "${{ inputs.registry }}/${{ inputs.service-name }}@${{ steps.build.outputs.digest }}"
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+
+      # ── 8. Promote to gitops-platform dev overlay (main branch only) ──────────
+      #
+      # Target path: apps/workloads/{service-name}/envs/dev/kustomization.yaml
+      # Requires WS-D1 (gitops-platform restructure) to be completed first.
+      - name: Checkout gitops-platform
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: meibel-ai/gitops-platform
+          token: ${{ steps.app-token.outputs.token }}
+          path: gitops-platform
+          ref: main
+
+      - name: Update image digest in dev overlay
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        id: promote
+        run: |
+          OVERLAY="gitops-platform/apps/workloads/${{ inputs.service-name }}/envs/dev"
+          DIGEST="${{ steps.build.outputs.digest }}"
+          SHORT_SHA="sha-$(echo '${{ github.sha }}' | cut -c1-7)"
+          BRANCH="promote/${{ inputs.service-name }}/${SHORT_SHA}"
+
+          if [ ! -d "$OVERLAY" ]; then
+            echo "ERROR: Overlay path $OVERLAY does not exist. Complete WS-D1 before wiring promotions." >&2
+            exit 1
+          fi
+
+          cd gitops-platform
+          git config user.name "meibel-deploy[bot]"
+          git config user.email "meibel-deploy[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+
+          sed -i "s|newTag:.*|newTag: \"${SHORT_SHA}\"|g" \
+            "apps/workloads/${{ inputs.service-name }}/envs/dev/kustomization.yaml"
+          sed -i "s|digest:.*|digest: \"${DIGEST}\"|g" \
+            "apps/workloads/${{ inputs.service-name }}/envs/dev/kustomization.yaml"
+
+          git add .
+          git diff --cached --quiet && echo "No overlay changes to promote." && exit 0
+
+          git commit -m "chore(promote): ${{ inputs.service-name }} ${SHORT_SHA} to dev"
+          git push origin "$BRANCH"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "short-sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Open promote PR
+        if: |
+          github.ref == 'refs/heads/main' &&
+          github.event_name == 'push' &&
+          steps.promote.outputs.branch != ''
+        run: |
+          gh pr create \
+            --repo meibel-ai/gitops-platform \
+            --base main \
+            --head "${{ steps.promote.outputs.branch }}" \
+            --title "promote(${{ inputs.service-name }}): ${{ steps.promote.outputs.short-sha }} to dev" \
+            --body "Automated promotion from [${{ github.repository }}@${{ github.sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+
+          Image: \`${{ inputs.registry }}/${{ inputs.service-name }}@${{ steps.build.outputs.digest }}\`"
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}

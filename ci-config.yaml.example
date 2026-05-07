@@ -1,0 +1,6 @@
+# ci-config.yaml — optional per-repo CI overrides
+# Place this file at the repo root to customize build-and-promote.yml behavior.
+
+# Set to true for repos with zero test files to skip the test step entirely.
+# Default: false (tests run if test files are detected automatically).
+skip-tests: false
