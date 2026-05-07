@@ -1,0 +1,157 @@
+name: Deploy Marker
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+        description: 'dev-gcp | dev-aws | staging | prod-gcp | prod-aws | hub-dev | hub'
+      version:
+        required: true
+        type: string
+        description: 'Image digest (sha256:...) or short SHA used as version label'
+      outcome:
+        required: true
+        type: string
+        description: 'success | failure | rollback'
+      canary-step:
+        required: false
+        type: string
+        default: ''
+        description: 'Argo Rollouts canary step: start | 10 | 30 | 50 | 100 | abort (empty = full deploy)'
+    secrets:
+      GRAFANA_API_URL:
+        required: true
+        description: 'Grafana Cloud API base URL, e.g. https://meibel.grafana.net'
+      GRAFANA_SERVICE_ACCOUNT_TOKEN:
+        required: true
+        description: 'Grafana service account token with Editor role'
+      OTEL_EXPORTER_OTLP_ENDPOINT:
+        required: true
+        description: 'OTLP HTTP endpoint, e.g. https://otlp-gateway-prod-us-east-0.grafana.net/otlp'
+      OTEL_EXPORTER_OTLP_HEADERS:
+        required: true
+        description: 'Authorization header value, e.g. Authorization=Basic <base64>'
+
+jobs:
+  mark:
+    name: Emit deploy marker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-http requests --quiet
+
+      # ── Grafana annotation ────────────────────────────────────────────────────
+      # Posts a vertical line annotation visible on all dashboards.
+      # Tag format: deploy, <service>, <environment>, <outcome>
+      - name: Post Grafana annotation
+        env:
+          GRAFANA_API_URL: ${{ secrets.GRAFANA_API_URL }}
+          GRAFANA_TOKEN: ${{ secrets.GRAFANA_SERVICE_ACCOUNT_TOKEN }}
+          SERVICE: ${{ inputs.service-name }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          VERSION: ${{ inputs.version }}
+          OUTCOME: ${{ inputs.outcome }}
+          CANARY_STEP: ${{ inputs.canary-step }}
+        run: |
+          python3 - <<'EOF'
+          import os, json, requests, time
+
+          service      = os.environ["SERVICE"]
+          environment  = os.environ["ENVIRONMENT"]
+          version      = os.environ["VERSION"]
+          outcome      = os.environ["OUTCOME"]
+          canary_step  = os.environ.get("CANARY_STEP", "")
+          api_url      = os.environ["GRAFANA_API_URL"].rstrip("/")
+          token        = os.environ["GRAFANA_TOKEN"]
+
+          if canary_step:
+              text = f"[{outcome.upper()}] {service} canary {canary_step}% → {environment}"
+          else:
+              text = f"[{outcome.upper()}] {service} → {environment}"
+
+          tags = ["deploy", service, environment, outcome]
+          if canary_step:
+              tags.append(f"canary-{canary_step}")
+
+          payload = {
+              "time": int(time.time() * 1000),
+              "tags": tags,
+              "text": f"{text}<br/>version: {version[:20]}",
+          }
+
+          resp = requests.post(
+              f"{api_url}/api/annotations",
+              headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+              json=payload,
+              timeout=10,
+          )
+          resp.raise_for_status()
+          print(f"Grafana annotation created: id={resp.json().get('id')}")
+          EOF
+
+      # ── OTLP metric: deployment.completed ─────────────────────────────────────
+      # Metric: deployment.completed (counter, value=1)
+      # Attributes: service, environment, version, outcome, canary_step
+      # Used downstream for DORA Change Failure Rate (outcome=failure|rollback).
+      - name: Emit OTLP deployment metric
+        env:
+          OTEL_SERVICE_NAME: ${{ inputs.service-name }}
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+          SERVICE: ${{ inputs.service-name }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          VERSION: ${{ inputs.version }}
+          OUTCOME: ${{ inputs.outcome }}
+          CANARY_STEP: ${{ inputs.canary-step }}
+        run: |
+          python3 - <<'EOF'
+          import os
+          from opentelemetry import metrics
+          from opentelemetry.sdk.metrics import MeterProvider
+          from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+          from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+          from opentelemetry.sdk.resources import Resource
+
+          resource = Resource.create({
+              "service.name":    os.environ["SERVICE"],
+              "service.version": os.environ["VERSION"][:20],
+          })
+
+          exporter = OTLPMetricExporter()
+          reader   = PeriodicExportingMetricReader(exporter, export_interval_millis=1000)
+          provider = MeterProvider(resource=resource, metric_readers=[reader])
+          metrics.set_meter_provider(provider)
+
+          meter   = metrics.get_meter("meibel.ci")
+          counter = meter.create_counter(
+              "deployment.completed",
+              description="Deployment events. outcome=failure|rollback feeds DORA CFR.",
+          )
+
+          attrs = {
+              "service":     os.environ["SERVICE"],
+              "environment": os.environ["ENVIRONMENT"],
+              "version":     os.environ["VERSION"][:20],
+              "outcome":     os.environ["OUTCOME"],
+          }
+          canary_step = os.environ.get("CANARY_STEP", "")
+          if canary_step:
+              attrs["canary_step"] = canary_step
+
+          counter.add(1, attrs)
+
+          # Force flush before process exits
+          provider.force_flush(timeout_millis=5000)
+          provider.shutdown()
+          print(f"OTLP metric emitted: deployment.completed {attrs}")
+          EOF
