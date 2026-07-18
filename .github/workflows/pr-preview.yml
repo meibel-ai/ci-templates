@@ -1,0 +1,309 @@
+name: PR Preview
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+      runs-on:
+        required: false
+        type: string
+        default: 'meibel-eks-dev'
+      registry:
+        required: false
+        type: string
+        default: 'ghcr.io/meibel-ai'
+      staging-cluster:
+        required: false
+        type: string
+        default: 'application-plane-staging'
+        description: 'GKE staging cluster name'
+      staging-project:
+        required: false
+        type: string
+        default: 'meibel-staging'
+        description: 'GCP project ID for staging cluster'
+      staging-region:
+        required: false
+        type: string
+        default: 'us-east4'
+      wif-provider:
+        required: false
+        type: string
+        default: 'projects/502352286495/locations/global/workloadIdentityPools/meibel-ai-gh-wd-pool/providers/meibel-ai-gh-wd-pool-provider'
+      preview-domain:
+        required: false
+        type: string
+        default: 'preview.meibel.ai'
+      max-concurrent-previews:
+        required: false
+        type: number
+        default: 20
+    secrets:
+      MEIBEL_DEPLOY_APP_ID:
+        required: true
+      MEIBEL_DEPLOY_APP_PRIVATE_KEY:
+        required: true
+
+# One preview env per PR — cancel in-flight deploy if a new commit arrives
+concurrency:
+  group: pr-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Deploy preview (on PR open / update) ─────────────────────────────────────
+  deploy-preview:
+    name: Deploy preview env
+    if: github.event.action != 'closed'
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
+      pull-requests: write
+
+    steps:
+      - name: Reject GPU services
+        run: |
+          if [ -f service.yaml ]; then
+            GPU=$(python3 -c "import yaml; d=yaml.safe_load(open('service.yaml')); print(d.get('spec',{}).get('runtime',{}).get('gpu',False))" 2>/dev/null || echo false)
+            if [ "$GPU" = "True" ] || [ "$GPU" = "true" ]; then
+              echo "PR preview is not available for GPU workloads (cost + spot node constraint)." >&2
+              exit 1
+            fi
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ inputs.wif-provider }}
+
+      - name: Get GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          app-id: ${{ secrets.MEIBEL_DEPLOY_APP_ID }}
+          private-key: ${{ secrets.MEIBEL_DEPLOY_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+
+      # ── Build PR image ────────────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          name: builder-${{ github.run_id }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ steps.app-token.outputs.token }}
+
+      - name: Build and push PR image
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          push: true
+          tags: ${{ inputs.registry }}/${{ inputs.service-name }}:pr-${{ github.event.pull_request.number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Enforce max concurrent preview envs ───────────────────────────────────
+      - name: Check concurrent preview limit
+        run: |
+          gcloud container clusters get-credentials ${{ inputs.staging-cluster }} \
+            --project=${{ inputs.staging-project }} \
+            --region=${{ inputs.staging-region }}
+
+          COUNT=$(kubectl get namespaces -l meibel.ai/preview=true \
+            --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          MAX=${{ inputs.max-concurrent-previews }}
+          NS="preview-${{ inputs.service-name }}-pr-${{ github.event.pull_request.number }}"
+
+          # Don't count this PR's own namespace (re-deploy case)
+          SELF_EXISTS=$(kubectl get namespace "$NS" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          EFFECTIVE=$((COUNT - SELF_EXISTS))
+
+          if [ "$EFFECTIVE" -ge "$MAX" ]; then
+            echo "ERROR: Max $MAX concurrent preview environments reached. Close an existing PR to free capacity." >&2
+            exit 1
+          fi
+          echo "ns=$NS" >> "$GITHUB_ENV"
+          echo "image_digest=${{ steps.build.outputs.digest }}" >> "$GITHUB_ENV"
+
+      # ── Create / update preview namespace ────────────────────────────────────
+      - name: Deploy preview namespace
+        run: |
+          NS="${{ env.ns }}"
+          EXPIRES_AT=$(date -u -d '+4 hours' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || \
+                       date -u -v+4H '+%Y-%m-%dT%H:%M:%SZ')  # GNU / BSD compat
+          IMAGE="${{ inputs.registry }}/${{ inputs.service-name }}@${{ env.image_digest }}"
+          PR_NUM="${{ github.event.pull_request.number }}"
+          SERVICE="${{ inputs.service-name }}"
+          DOMAIN="${{ inputs.preview-domain }}"
+          PREVIEW_HOST="pr-${PR_NUM}.${DOMAIN}"
+
+          # Namespace with TTL annotation and preview label
+          kubectl apply -f - <<YAML
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: ${NS}
+            labels:
+              meibel.ai/preview: "true"
+              meibel.ai/service: "${SERVICE}"
+              meibel.ai/pr: "${PR_NUM}"
+            annotations:
+              meibel.ai/preview-expires-at: "${EXPIRES_AT}"
+              meibel.ai/preview-url: "https://${PREVIEW_HOST}"
+          YAML
+
+          # Minimal Deployment at 25% of staging sizing
+          kubectl apply -n "$NS" -f - <<YAML
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${SERVICE}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: ${SERVICE}
+            template:
+              metadata:
+                labels:
+                  app: ${SERVICE}
+              spec:
+                nodeSelector:
+                  workload-type: preview
+                tolerations:
+                  - key: workload-type
+                    operator: Equal
+                    value: preview
+                    effect: NoSchedule
+                containers:
+                  - name: ${SERVICE}
+                    image: ${IMAGE}
+                    resources:
+                      requests:
+                        cpu: 125m
+                        memory: 128Mi
+                      limits:
+                        cpu: 500m
+                        memory: 512Mi
+          YAML
+
+          # ClusterIP Service
+          kubectl apply -n "$NS" -f - <<YAML
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${SERVICE}
+          spec:
+            selector:
+              app: ${SERVICE}
+            ports:
+              - port: 80
+                targetPort: 8080
+          YAML
+
+          # Ingress — External-DNS picks up the hostname annotation
+          kubectl apply -n "$NS" -f - <<YAML
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: ${SERVICE}
+            annotations:
+              external-dns.alpha.kubernetes.io/hostname: "${PREVIEW_HOST}"
+              kubernetes.io/ingress.class: nginx
+          spec:
+            rules:
+              - host: ${PREVIEW_HOST}
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: ${SERVICE}
+                          port:
+                            number: 80
+          YAML
+
+          # Wait up to 8 minutes for rollout (10-min target, leaving buffer for DNS)
+          kubectl rollout status deployment/"${SERVICE}" -n "$NS" --timeout=480s
+
+          echo "PREVIEW_URL=https://${PREVIEW_HOST}" >> "$GITHUB_ENV"
+
+      # ── Post PR comment ───────────────────────────────────────────────────────
+      - name: Post preview URL comment
+        run: |
+          BODY="## Preview environment ready
+
+          | | |
+          |---|---|
+          | **URL** | [${{ env.PREVIEW_URL }}](${{ env.PREVIEW_URL }}) |
+          | **Image** | \`${{ env.image_digest }}\` |
+          | **Expires** | 4 hours after last push (auto-teardown) |
+          | **Access** | Cloudflare Access SSO — sign in with your \`@meibel.ai\` Google account |
+
+          > Preview pods run on spot nodes. Cold start may take ~30s on first request."
+
+          # Update existing comment if present, otherwise create
+          COMMENT_ID=$(gh pr view ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --json comments \
+            --jq '.comments[] | select(.body | startswith("## Preview environment")) | .id' \
+            2>/dev/null | head -1)
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api repos/${{ github.repository }}/issues/comments/"$COMMENT_ID" \
+              --method PATCH \
+              --field body="$BODY"
+          else
+            gh pr comment ${{ github.event.pull_request.number }} \
+              --repo ${{ github.repository }} \
+              --body "$BODY"
+          fi
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  # ── Teardown preview (on PR close) ───────────────────────────────────────────
+  teardown-preview:
+    name: Teardown preview env
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ inputs.wif-provider }}
+
+      - name: Delete preview namespace
+        run: |
+          gcloud container clusters get-credentials ${{ inputs.staging-cluster }} \
+            --project=${{ inputs.staging-project }} \
+            --region=${{ inputs.staging-region }}
+
+          NS="preview-${{ inputs.service-name }}-pr-${{ github.event.pull_request.number }}"
+          if kubectl get namespace "$NS" &>/dev/null; then
+            kubectl delete namespace "$NS" --wait=false
+            echo "Namespace $NS deletion initiated."
+          else
+            echo "Namespace $NS not found — already cleaned up."
+          fi
+
+  # ── TTL sweep (runs on schedule in gitops-platform, not called here) ─────────
+  # gitops-platform/.github/workflows/preview-ttl-sweep.yml calls this pattern:
+  #   kubectl get namespaces -l meibel.ai/preview=true -o json | \
+  #     jq -r '.items[] | select(.metadata.annotations["meibel.ai/preview-expires-at"] < now|todate) | .metadata.name' | \
+  #     xargs -r kubectl delete namespace
