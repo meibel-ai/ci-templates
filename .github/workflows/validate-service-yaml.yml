@@ -2,7 +2,9 @@ name: Validate service.yaml
 
 # Reusable workflow — called from each domain repo's `.github/workflows/`.
 # Validates every service.yaml under the caller repo against the shared JSON
-# Schema hosted in gitops-platform (Notion Repo-Reorg Companion 02 + 03).
+# Schema. Schema is mirrored at ci-templates/schemas/service.schema.json
+# (authoritative copy in gitops-platform/schemas/, mirrored here for
+# private-repo raw-fetch access — see 2026-07-18 pilot for the reason).
 #
 # Callable example (in <domain-repo>/.github/workflows/pr.yml):
 #   jobs:
@@ -27,11 +29,11 @@ on:
         required: false
         type: string
         default: 'services/*/service.yaml'
-      schema-ref:
-        description: 'Git ref in gitops-platform to fetch the schema from. Default `main`; pin to a SHA for reproducibility.'
+      ci-templates-ref:
+        description: 'Git ref in ci-templates from which to load the schema. Default matches the reusable workflow ref (@v1). Pin to a SHA for reproducibility.'
         required: false
         type: string
-        default: 'main'
+        default: 'v1'
 
 permissions:
   contents: read
@@ -44,6 +46,17 @@ jobs:
       - name: Checkout caller repo
         uses: actions/checkout@v4
 
+      - name: Checkout ci-templates (for schema)
+        # ci-templates access_level is `organization`, so the caller's
+        # GITHUB_TOKEN has read access to it via actions/checkout.
+        uses: actions/checkout@v4
+        with:
+          repository: meibel-ai/ci-templates
+          ref: ${{ inputs.ci-templates-ref }}
+          path: .ci-templates
+          sparse-checkout: schemas/service.schema.json
+          sparse-checkout-cone-mode: false
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -52,13 +65,16 @@ jobs:
       - name: Install check-jsonschema
         run: pip install --quiet 'check-jsonschema>=0.29'
 
-      - name: Fetch service.schema.json from gitops-platform
+      - name: Verify schema present
         run: |
           set -euo pipefail
-          SCHEMA_URL="https://raw.githubusercontent.com/meibel-ai/gitops-platform/${{ inputs.schema-ref }}/schemas/service.schema.json"
-          echo "Fetching schema: $SCHEMA_URL"
-          curl -fsSL --retry 3 --retry-delay 2 "$SCHEMA_URL" -o /tmp/service.schema.json
-          echo "Schema $(wc -c < /tmp/service.schema.json) bytes"
+          SCHEMA_PATH=".ci-templates/schemas/service.schema.json"
+          if [ ! -f "$SCHEMA_PATH" ]; then
+            echo "Schema not found at $SCHEMA_PATH" >&2
+            ls -la .ci-templates/ 2>&1 || true
+            exit 1
+          fi
+          echo "Schema $(wc -c < $SCHEMA_PATH) bytes"
 
       - name: Enumerate service.yaml files
         id: enumerate
@@ -87,7 +103,7 @@ jobs:
         run: |
           set -euo pipefail
           xargs -a /tmp/service-yaml-files.txt \
-            check-jsonschema --schemafile /tmp/service.schema.json
+            check-jsonschema --schemafile .ci-templates/schemas/service.schema.json
 
       - name: Summarize
         if: always()
@@ -95,5 +111,5 @@ jobs:
           if [ "${{ steps.enumerate.outputs.count }}" = "0" ]; then
             echo "No service.yaml files present — nothing to validate. Add one under services/<name>/service.yaml when the repo has its first service."
           else
-            echo "Validated ${{ steps.enumerate.outputs.count }} service.yaml file(s) against schemas/service.schema.json@${{ inputs.schema-ref }}."
+            echo "Validated ${{ steps.enumerate.outputs.count }} service.yaml file(s) against ci-templates/schemas/service.schema.json@${{ inputs.ci-templates-ref }}."
           fi

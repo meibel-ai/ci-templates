@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/meibel-ai/gitops-platform/main/schemas/service.schema.json",
+  "title": "Meibel service.yaml",
+  "description": "Schema for per-service catalog metadata (Notion Repo-Reorg Companion 02). Every service under <domain-repo>/services/<svc>/service.yaml must satisfy this schema. Validated on PR by ci-templates validate-service-yaml.yml.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": {
+      "type": "string",
+      "const": "meibel.ai/v1"
+    },
+    "kind": {
+      "type": "string",
+      "const": "Service"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "domain"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,48}[a-z0-9]$",
+          "description": "Kebab-case service name; matches chart name + K8s resource name."
+        },
+        "domain": {
+          "type": "string",
+          "enum": [
+            "data-platform",
+            "agent-platform",
+            "confidence-platform",
+            "platform-ui",
+            "platform-services",
+            "meibel-core"
+          ],
+          "description": "Owning domain repo. `meibel-core` retained for legacy services until Notion Week 5 archives it."
+        }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tier", "owner", "deployment", "runtime"],
+      "properties": {
+        "tier": {
+          "type": "integer",
+          "enum": [1, 2, 3],
+          "description": "Service tier per Companion 05. 1=user-facing prod critical, 2=default, 3=internal/dev-only."
+        },
+        "system": {
+          "type": "string",
+          "description": "Optional Backstage-style system grouping (e.g. `ingestion`, `gateway`, `rag`)."
+        },
+        "owner": {
+          "type": "object",
+          "additionalProperties": false,
+          "anyOf": [
+            {"required": ["team"]},
+            {"required": ["lead"]}
+          ],
+          "properties": {
+            "team": {"type": "string", "description": "Owning team slug."},
+            "lead": {"type": "string", "description": "Owning individual (GitHub handle preferred)."}
+          },
+          "description": "At least one of `team` or `lead` required."
+        },
+        "sla": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "availability": {"type": "number", "minimum": 0, "maximum": 100},
+            "latency_p95_ms": {"type": "integer", "minimum": 0}
+          }
+        },
+        "deployment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["targets"],
+          "properties": {
+            "targets": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "enum": ["gcp-dev", "aws-dev", "staging", "gcp-prod", "aws-prod"]
+              },
+              "description": "Cloud+env targets. Drives ApplicationSet routing (Companion 01). `staging` is GCP-only."
+            },
+            "replicas": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "dev": {"type": "integer", "minimum": 0},
+                "staging": {"type": "integer", "minimum": 0},
+                "prod": {"type": "integer", "minimum": 0}
+              }
+            },
+            "resources": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": {"type": "string", "description": "K8s CPU quantity (e.g. `500m`, `2`)."},
+                "memory": {"type": "string", "description": "K8s memory quantity (e.g. `1Gi`, `16Gi`)."},
+                "gpu": {"type": "integer", "minimum": 0, "description": "GPU count per replica (0 for CPU workloads)."}
+              }
+            },
+            "progressive": {
+              "type": "boolean",
+              "default": false,
+              "description": "Progressive delivery via Argo Rollouts. MUST be false for rayservice framework (Companion 02 §Schema Validation)."
+            }
+          }
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Services or models this service calls. Fill during owner review; empty array acceptable."
+        },
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["language"],
+          "properties": {
+            "language": {
+              "type": "string",
+              "enum": ["python", "node", "go", "rust"]
+            },
+            "framework": {
+              "type": "string",
+              "enum": ["fastapi", "temporal-worker", "rayservice", "express", "nextjs", "gin", "actix"]
+            }
+          }
+        },
+        "agent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["context_files", "change_scope"],
+          "properties": {
+            "context_files": {
+              "type": "array",
+              "items": {"type": "string"},
+              "minItems": 1
+            },
+            "change_scope": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["autonomous", "human_review_required"],
+              "properties": {
+                "autonomous": {
+                  "type": "array",
+                  "items": {"type": "string"},
+                  "description": "Paths (glob or prefix) an AI agent may edit without PR review."
+                },
+                "human_review_required": {
+                  "type": "array",
+                  "items": {"type": "string"},
+                  "description": "Paths that require human PR review before merge."
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "$comment": "CI-enforced rule (Companion 02 §Schema Validation): rayservice runtime MUST have deployment.progressive=false. Argo Rollouts + RayService are incompatible per Companion 08.",
+      "if": {
+        "properties": {
+          "spec": {
+            "properties": {
+              "runtime": {
+                "properties": {"framework": {"const": "rayservice"}},
+                "required": ["framework"]
+              }
+            },
+            "required": ["runtime"]
+          }
+        },
+        "required": ["spec"]
+      },
+      "then": {
+        "properties": {
+          "spec": {
+            "properties": {
+              "deployment": {
+                "properties": {"progressive": {"const": false}}
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
