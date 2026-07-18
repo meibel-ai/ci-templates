@@ -1,0 +1,152 @@
+name: Create Release
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+      service-repo:
+        required: true
+        type: string
+        description: 'GitHub repo containing the service code, e.g. meibel-ai/data-platform'
+      app-commit-sha:
+        required: true
+        type: string
+        description: 'Commit SHA in the service repo that was built and promoted'
+      gitops-commit-sha:
+        required: true
+        type: string
+        description: 'Merge commit SHA in gitops-platform that triggered this release'
+      image-digest:
+        required: true
+        type: string
+        description: 'sha256:... digest of the released image'
+      environment:
+        required: true
+        type: string
+        description: 'prod-gcp | prod-aws | hub'
+      approver:
+        required: false
+        type: string
+        default: ''
+        description: 'GitHub login of the PR approver'
+      previous-digest:
+        required: false
+        type: string
+        default: ''
+        description: 'Previous known-good image digest for rollback pointer'
+      registry:
+        required: false
+        type: string
+        default: 'ghcr.io/meibel-ai'
+    secrets:
+      MEIBEL_DEPLOY_APP_ID:
+        required: true
+      MEIBEL_DEPLOY_APP_PRIVATE_KEY:
+        required: true
+
+jobs:
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout service repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ inputs.service-repo }}
+          ref: ${{ inputs.app-commit-sha }}
+          fetch-depth: 1
+
+      - name: Get GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          app-id: ${{ secrets.MEIBEL_DEPLOY_APP_ID }}
+          private-key: ${{ secrets.MEIBEL_DEPLOY_APP_PRIVATE_KEY }}
+          repositories: ${{ inputs.service-repo }}
+
+      - name: Download SBOM artifact
+        id: sbom
+        continue-on-error: true
+        run: |
+          # SBOM is uploaded as an artifact in the build job; fetch if available
+          gh run list \
+            --repo "${{ inputs.service-repo }}" \
+            --commit "${{ inputs.app-commit-sha }}" \
+            --json databaseId \
+            --jq '.[0].databaseId' > run_id.txt 2>/dev/null || true
+
+          RUN_ID=$(cat run_id.txt 2>/dev/null || echo "")
+          if [ -n "$RUN_ID" ]; then
+            gh run download "$RUN_ID" \
+              --repo "${{ inputs.service-repo }}" \
+              --name sbom \
+              --dir sbom/ 2>/dev/null && echo "sbom_found=true" >> "$GITHUB_OUTPUT" || true
+          fi
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Compute release tag
+        id: tag
+        run: |
+          SHORT_SHA=$(echo "${{ inputs.app-commit-sha }}" | cut -c1-7)
+          ENV_SUFFIX=$(echo "${{ inputs.environment }}" | tr '-' '.')
+          TAG="${{ inputs.service-name }}-${ENV_SUFFIX}-${SHORT_SHA}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "short-sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release notes
+        id: notes
+        run: |
+          SHORT_SHA="${{ steps.tag.outputs.short-sha }}"
+          ROLLBACK_LINE=""
+          if [ -n "${{ inputs.previous-digest }}" ]; then
+            PREV_SHORT=$(echo "${{ inputs.previous-digest }}" | cut -c8-14)
+            ROLLBACK_LINE="| **Rollback to** | \`${{ inputs.previous-digest }}\` (digest \`${PREV_SHORT}\`) |"
+          fi
+
+          APPROVER_LINE=""
+          if [ -n "${{ inputs.approver }}" ]; then
+            APPROVER_LINE="| **Approved by** | @${{ inputs.approver }} |"
+          fi
+
+          cat > release_notes.md <<NOTES
+          ## ${{ inputs.service-name }} — ${{ inputs.environment }} — ${SHORT_SHA}
+
+          | | |
+          |---|---|
+          | **Environment** | \`${{ inputs.environment }}\` |
+          | **App commit** | [\`${SHORT_SHA}\`](https://github.com/${{ inputs.service-repo }}/commit/${{ inputs.app-commit-sha }}) |
+          | **GitOps commit** | [\`$(echo "${{ inputs.gitops-commit-sha }}" | cut -c1-7)\`](https://github.com/meibel-ai/gitops-platform/commit/${{ inputs.gitops-commit-sha }}) |
+          | **Image** | \`${{ inputs.registry }}/${{ inputs.service-name }}@${{ inputs.image-digest }}\` |
+          | **SBOM** | See release assets |
+          | **Cosign signature** | \`cosign verify ${{ inputs.registry }}/${{ inputs.service-name }}@${{ inputs.image-digest }} --certificate-identity-regexp=".*meibel-ai/ci-templates.*" --certificate-oidc-issuer="https://token.actions.githubusercontent.com"\` |
+          ${APPROVER_LINE}
+          ${ROLLBACK_LINE}
+          | **Released at** | $(date -u '+%Y-%m-%dT%H:%M:%SZ') |
+
+          ### Rollback procedure
+          \`\`\`bash
+          # Update gitops-platform dev overlay digest and open a new promote PR
+          # pointing to the previous-digest above, then follow the normal prod promote flow.
+          \`\`\`
+          NOTES
+
+          echo "notes_file=release_notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        run: |
+          SBOM_FLAG=""
+          if [ -f sbom/sbom.spdx.json ]; then
+            SBOM_FLAG="--attach sbom/sbom.spdx.json"
+          fi
+
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --repo "${{ inputs.service-repo }}" \
+            --title "${{ inputs.service-name }} → ${{ inputs.environment }} (${{ steps.tag.outputs.short-sha }})" \
+            --notes-file release_notes.md \
+            --target "${{ inputs.app-commit-sha }}" \
+            $SBOM_FLAG
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
