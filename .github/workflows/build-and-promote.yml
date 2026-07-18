@@ -33,6 +33,18 @@ on:
         required: false
         type: string
         default: 'gha'
+      service-path:
+        description: |
+          Repo-relative path to the service directory (contains Dockerfile,
+          pyproject.toml, tests/, etc.).
+          - meibel-core layout: '.' (default) — service files at repo root or
+            in per-service subdirs consumed via context_dir at caller level.
+          - Domain-repo layout (Companion 02): 'services/<name>' — every
+            filesystem-touching step runs from here + docker build uses it
+            as context. Scaffolder v0.14.1+ passes this automatically.
+        required: false
+        type: string
+        default: '.'
     secrets:
       MEIBEL_DEPLOY_APP_ID:
         required: true
@@ -48,6 +60,13 @@ jobs:
       contents: read
       packages: write       # GHCR push
       security-events: write # Trivy SARIF upload
+
+    # All `run:` steps default to the service directory. `uses:` steps that
+    # touch the filesystem (docker/build-push-action, actions/cache) get an
+    # explicit path derived from `${{ inputs.service-path }}`.
+    defaults:
+      run:
+        working-directory: ${{ inputs.service-path }}
 
     steps:
       # ── 0. Validate required inputs ──────────────────────────────────────────
@@ -125,8 +144,10 @@ jobs:
         if: inputs.language == 'python'
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          path: .venv
-          key: venv-${{ runner.os }}-3.11-${{ hashFiles('**/poetry.lock') }}
+          # actions/cache path is relative to the workspace root, not
+          # defaults.run.working-directory, so include service-path here.
+          path: ${{ inputs.service-path }}/.venv
+          key: venv-${{ runner.os }}-3.11-${{ inputs.service-path }}-${{ hashFiles(format('{0}/poetry.lock', inputs.service-path)) }}
 
       - name: Install Python dependencies
         if: inputs.language == 'python'
@@ -240,7 +261,7 @@ jobs:
         id: build
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
-          context: .
+          context: ${{ inputs.service-path }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
