@@ -45,6 +45,13 @@ on:
         required: false
         type: string
         default: '.'
+      promote-env:
+        description: |
+          Target env overlay for the promotion PR (gitops-platform
+          apps/workloads/<name>/envs/<env>/). Default: 'dev'.
+        required: false
+        type: string
+        default: 'dev'
     secrets:
       MEIBEL_DEPLOY_APP_ID:
         required: true
@@ -328,8 +335,15 @@ jobs:
 
       # ── 8. Promote to gitops-platform dev overlay (main branch only) ──────────
       #
-      # Target path: apps/workloads/{service-name}/envs/dev/kustomization.yaml
-      # Requires WS-D1 (gitops-platform restructure) to be completed first.
+      # Auto-detects the overlay format:
+      #   - kustomization.yaml → kustomize path (legacy meibel-core services;
+      #     Companion 04 target for domain-repo services once branch-per-env
+      #     lands). Uses `sed newTag:` + `sed digest:`.
+      #   - values.yaml → Helm path (scaffolder v0.14 domain-repo services).
+      #     Uses yq to update `.image.tag` + `.image.digest`.
+      #   - neither → error with actionable message.
+      #
+      # Env target default: dev. Override via `promote-env` input.
       - name: Checkout gitops-platform
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -339,37 +353,77 @@ jobs:
           path: gitops-platform
           ref: main
 
-      - name: Update image digest in dev overlay
+      - name: Update image digest in overlay
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         id: promote
+        working-directory: .
         run: |
-          OVERLAY="gitops-platform/apps/workloads/${{ inputs.service-name }}/envs/dev"
+          set -euo pipefail
+          ENV="${{ inputs.promote-env }}"
+          OVERLAY="gitops-platform/apps/workloads/${{ inputs.service-name }}/envs/${ENV}"
           DIGEST="${{ steps.build.outputs.digest }}"
           SHORT_SHA="sha-$(echo '${{ github.sha }}' | cut -c1-7)"
           BRANCH="promote/${{ inputs.service-name }}/${SHORT_SHA}"
 
           if [ ! -d "$OVERLAY" ]; then
-            echo "ERROR: Overlay path $OVERLAY does not exist. Complete WS-D1 before wiring promotions." >&2
+            echo "ERROR: Overlay path $OVERLAY does not exist." >&2
+            echo "Expected either:" >&2
+            echo "  - apps/workloads/${{ inputs.service-name }}/envs/${ENV}/kustomization.yaml (kustomize)" >&2
+            echo "  - apps/workloads/${{ inputs.service-name }}/envs/${ENV}/values.yaml (Helm)" >&2
             exit 1
           fi
+
+          KUST_FILE="${OVERLAY}/kustomization.yaml"
+          VALUES_FILE="${OVERLAY}/values.yaml"
+
+          # Detect layout
+          if [ -f "$KUST_FILE" ]; then
+              LAYOUT="kustomize"
+              TARGET_FILE="$KUST_FILE"
+          elif [ -f "$VALUES_FILE" ]; then
+              LAYOUT="helm"
+              TARGET_FILE="$VALUES_FILE"
+          else
+              echo "ERROR: neither kustomization.yaml nor values.yaml found under $OVERLAY" >&2
+              ls -la "$OVERLAY" >&2 || true
+              exit 1
+          fi
+          echo "Detected layout: $LAYOUT — updating $TARGET_FILE"
 
           cd gitops-platform
           git config user.name "meibel-deploy[bot]"
           git config user.email "meibel-deploy[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
 
-          sed -i "s|newTag:.*|newTag: \"${SHORT_SHA}\"|g" \
-            "apps/workloads/${{ inputs.service-name }}/envs/dev/kustomization.yaml"
-          sed -i "s|digest:.*|digest: \"${DIGEST}\"|g" \
-            "apps/workloads/${{ inputs.service-name }}/envs/dev/kustomization.yaml"
+          REL_TARGET="apps/workloads/${{ inputs.service-name }}/envs/${ENV}/$(basename "$TARGET_FILE")"
+
+          case "$LAYOUT" in
+            kustomize)
+              sed -i "s|newTag:.*|newTag: \"${SHORT_SHA}\"|g" "$REL_TARGET"
+              sed -i "s|digest:.*|digest: \"${DIGEST}\"|g" "$REL_TARGET"
+              ;;
+            helm)
+              # yq is preinstalled on GitHub-hosted ubuntu runners. On self-hosted
+              # (meibel-eks-dev / super-runner) install it if missing.
+              if ! command -v yq >/dev/null 2>&1; then
+                echo "yq not found — installing pinned binary"
+                curl -fsSL -o /tmp/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+                chmod +x /tmp/yq
+                sudo mv /tmp/yq /usr/local/bin/yq
+              fi
+              yq -i ".image.tag = \"${SHORT_SHA}\"" "$REL_TARGET"
+              yq -i ".image.digest = \"${DIGEST}\"" "$REL_TARGET"
+              ;;
+          esac
 
           git add .
           git diff --cached --quiet && echo "No overlay changes to promote." && exit 0
 
-          git commit -m "chore(promote): ${{ inputs.service-name }} ${SHORT_SHA} to dev"
+          git commit -m "chore(promote): ${{ inputs.service-name }} ${SHORT_SHA} to ${ENV} (${LAYOUT})"
           git push origin "$BRANCH"
           echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
           echo "short-sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "layout=${LAYOUT}" >> "$GITHUB_OUTPUT"
 
       - name: Open promote PR
         if: |
