@@ -69,8 +69,14 @@ jobs:
         working-directory: ${{ inputs.service-path }}
 
     steps:
-      # ── 0. Validate required inputs ──────────────────────────────────────────
+      # ── 0. Checkout FIRST — defaults.run.working-directory won't resolve
+      #      to services/<name>/ until the repo is on disk.
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # ── 1. Validate required inputs ──────────────────────────────────────────
       - name: Validate language input
+        working-directory: .  # override job default — no filesystem needed for validation
         run: |
           case "${{ inputs.language }}" in
             python|node|go|rust) ;;
@@ -80,9 +86,14 @@ jobs:
               ;;
           esac
 
-      # ── 1. Checkout + read ci-config.yaml overrides ──────────────────────────
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Validate service-path exists
+        working-directory: .
+        run: |
+          if [ ! -d "${{ inputs.service-path }}" ]; then
+            echo "ERROR: service-path '${{ inputs.service-path }}' does not exist in the caller repo." >&2
+            echo "For meibel-core layout use '.' (default). For domain-repo layout use 'services/<name>'." >&2
+            exit 1
+          fi
 
       - name: Read ci-config.yaml overrides
         id: ci-config
