@@ -259,12 +259,18 @@ jobs:
         with:
           name: builder-${{ github.run_id }}
 
+      # GHCR login uses the CALLER's GITHUB_TOKEN (repo-native) not the meibel-deploy
+      # App token. Reason: GHCR auto-scopes a NEW package to the pushing repo only
+      # when the token is repo-native. App-token pushes attempt to create the
+      # package as org-scoped, which fails with 'installation not allowed to Create
+      # organization package'. The meibel-deploy App token is still needed for the
+      # gitops-platform promote PR (cross-repo push), so keep it separate.
       - name: Log in to GHCR
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ steps.app-token.outputs.token }}
+          password: ${{ github.token }}
 
       - name: Extract image metadata
         id: meta
