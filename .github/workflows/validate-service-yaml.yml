@@ -1,0 +1,99 @@
+name: Validate service.yaml
+
+# Reusable workflow — called from each domain repo's `.github/workflows/`.
+# Validates every service.yaml under the caller repo against the shared JSON
+# Schema hosted in gitops-platform (Notion Repo-Reorg Companion 02 + 03).
+#
+# Callable example (in <domain-repo>/.github/workflows/pr.yml):
+#   jobs:
+#     validate-service-yaml:
+#       uses: meibel-ai/ci-templates/.github/workflows/validate-service-yaml.yml@v1
+#       with:
+#         service-yaml-glob: 'services/*/service.yaml'
+#
+# CI-enforced rules (via schema, not workflow logic):
+#   - metadata.name is kebab-case; metadata.domain is one of the 5 domain repos
+#     (or meibel-core during migration).
+#   - spec.tier is 1|2|3; spec.owner has team OR lead.
+#   - spec.deployment.targets is a non-empty subset of the allowed cloud+env enum.
+#   - spec.runtime.framework=rayservice REQUIRES spec.deployment.progressive=false
+#     (Argo Rollouts + RayService are incompatible — Companion 08).
+
+on:
+  workflow_call:
+    inputs:
+      service-yaml-glob:
+        description: 'Glob for service.yaml files under the caller repo. Default matches domain-repo layout.'
+        required: false
+        type: string
+        default: 'services/*/service.yaml'
+      schema-ref:
+        description: 'Git ref in gitops-platform to fetch the schema from. Default `main`; pin to a SHA for reproducibility.'
+        required: false
+        type: string
+        default: 'main'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate service.yaml files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install check-jsonschema
+        run: pip install --quiet 'check-jsonschema>=0.29'
+
+      - name: Fetch service.schema.json from gitops-platform
+        run: |
+          set -euo pipefail
+          SCHEMA_URL="https://raw.githubusercontent.com/meibel-ai/gitops-platform/${{ inputs.schema-ref }}/schemas/service.schema.json"
+          echo "Fetching schema: $SCHEMA_URL"
+          curl -fsSL --retry 3 --retry-delay 2 "$SCHEMA_URL" -o /tmp/service.schema.json
+          echo "Schema $(wc -c < /tmp/service.schema.json) bytes"
+
+      - name: Enumerate service.yaml files
+        id: enumerate
+        run: |
+          set -euo pipefail
+          # Use `find` for a POSIX-consistent expansion of the glob; the
+          # workflow input is a shell glob, not a regex.
+          #
+          # Convert `services/*/service.yaml` → find pattern.
+          # For a general solution, we `ls -1` the glob and fall back to `find`
+          # if the glob doesn't match (find prints nothing rather than erroring).
+          FILES=$(compgen -G "${{ inputs.service-yaml-glob }}" || true)
+          if [ -z "$FILES" ]; then
+            echo "No service.yaml files matched glob '${{ inputs.service-yaml-glob }}'."
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Found $(echo "$FILES" | wc -l | tr -d ' ') service.yaml file(s):"
+          echo "$FILES"
+          echo "count=$(echo "$FILES" | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
+          # Persist newline-delimited list for the next step
+          echo "$FILES" > /tmp/service-yaml-files.txt
+
+      - name: Validate each service.yaml against schema
+        if: steps.enumerate.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          xargs -a /tmp/service-yaml-files.txt \
+            check-jsonschema --schemafile /tmp/service.schema.json
+
+      - name: Summarize
+        if: always()
+        run: |
+          if [ "${{ steps.enumerate.outputs.count }}" = "0" ]; then
+            echo "No service.yaml files present — nothing to validate. Add one under services/<name>/service.yaml when the repo has its first service."
+          else
+            echo "Validated ${{ steps.enumerate.outputs.count }} service.yaml file(s) against schemas/service.schema.json@${{ inputs.schema-ref }}."
+          fi
