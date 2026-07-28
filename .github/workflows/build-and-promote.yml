@@ -116,16 +116,8 @@ jobs:
           SKIP_TESTS=false
           SKIP_LINT=false
           if [ -f ci-config.yaml ]; then
-            SKIP_TESTS=$(python3 -c "
-          import yaml, sys
-          d = yaml.safe_load(open('ci-config.yaml'))
-          print(str(d.get('skip-tests', False)).lower())
-          " 2>/dev/null || echo false)
-            SKIP_LINT=$(python3 -c "
-          import yaml, sys
-          d = yaml.safe_load(open('ci-config.yaml'))
-          print(str(d.get('skip-lint', False)).lower())
-          " 2>/dev/null || echo false)
+            grep -qE '^skip-tests:\s+true' ci-config.yaml 2>/dev/null && SKIP_TESTS=true
+            grep -qE '^skip-lint:\s+true' ci-config.yaml 2>/dev/null && SKIP_LINT=true
           fi
 
           # Detect whether test files exist so test steps are no-ops on repos with none
