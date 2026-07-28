@@ -115,9 +115,11 @@ jobs:
         run: |
           SKIP_TESTS=false
           SKIP_LINT=false
+          SKIP_TRIVY=false
           if [ -f ci-config.yaml ]; then
             grep -qE '^skip-tests:\s+true' ci-config.yaml 2>/dev/null && SKIP_TESTS=true
             grep -qE '^skip-lint:\s+true' ci-config.yaml 2>/dev/null && SKIP_LINT=true
+            grep -qE '^skip-trivy:\s+true' ci-config.yaml 2>/dev/null && SKIP_TRIVY=true
           fi
 
           # Detect whether test files exist so test steps are no-ops on repos with none
@@ -139,6 +141,7 @@ jobs:
 
           echo "skip-tests=${SKIP_TESTS}" >> "$GITHUB_OUTPUT"
           echo "skip-lint=${SKIP_LINT}" >> "$GITHUB_OUTPUT"
+          echo "skip-trivy=${SKIP_TRIVY}" >> "$GITHUB_OUTPUT"
           echo "has-tests=${HAS_TESTS}" >> "$GITHUB_OUTPUT"
 
       # ── 2. GCP auth (WIF) — needed by Python for Artifact Registry deps ──────
@@ -325,7 +328,7 @@ jobs:
           image-ref: ${{ inputs.registry }}/${{ inputs.service-name }}@${{ steps.build.outputs.digest }}
           format: sarif
           output: trivy-results.sarif
-          exit-code: '1'
+          exit-code: ${{ steps.ci-config.outputs.skip-trivy == 'true' && '0' || '1' }}
           severity: 'HIGH,CRITICAL'
           ignore-unfixed: true
 
