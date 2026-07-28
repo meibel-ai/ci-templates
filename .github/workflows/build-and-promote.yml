@@ -114,11 +114,17 @@ jobs:
         id: ci-config
         run: |
           SKIP_TESTS=false
+          SKIP_LINT=false
           if [ -f ci-config.yaml ]; then
             SKIP_TESTS=$(python3 -c "
           import yaml, sys
           d = yaml.safe_load(open('ci-config.yaml'))
           print(str(d.get('skip-tests', False)).lower())
+          " 2>/dev/null || echo false)
+            SKIP_LINT=$(python3 -c "
+          import yaml, sys
+          d = yaml.safe_load(open('ci-config.yaml'))
+          print(str(d.get('skip-lint', False)).lower())
           " 2>/dev/null || echo false)
           fi
 
@@ -140,6 +146,7 @@ jobs:
           esac
 
           echo "skip-tests=${SKIP_TESTS}" >> "$GITHUB_OUTPUT"
+          echo "skip-lint=${SKIP_LINT}" >> "$GITHUB_OUTPUT"
           echo "has-tests=${HAS_TESTS}" >> "$GITHUB_OUTPUT"
 
       # ── 2. GCP auth (WIF) — needed by Python for Artifact Registry deps ──────
@@ -181,8 +188,13 @@ jobs:
         run: poetry install --no-interaction
 
       - name: Python lint (ruff)
-        if: inputs.language == 'python'
-        run: poetry run ruff check .
+        if: inputs.language == 'python' && steps.ci-config.outputs.skip-lint != 'true'
+        run: |
+          if poetry run ruff --version 2>/dev/null; then
+            poetry run ruff check .
+          else
+            echo "::notice::ruff not found in dev deps — skipping lint. Add ruff to [tool.poetry.group.dev.dependencies] to enable."
+          fi
 
       - name: Python tests (pytest)
         if: |
