@@ -462,13 +462,18 @@ jobs:
           github.event_name == 'push' &&
           steps.promote.outputs.branch != ''
         run: |
-          gh pr create \
-            --repo meibel-ai/gitops-platform \
-            --base main \
-            --head "${{ steps.promote.outputs.branch }}" \
-            --title "promote(${{ inputs.service-name }}): ${{ steps.promote.outputs.short-sha }} to dev" \
-            --body "Automated promotion from [${{ github.repository }}@${{ github.sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
-
-          Image: \`${{ inputs.registry }}/${{ inputs.service-name }}@${{ steps.build.outputs.digest }}\`"
+          # Use curl directly — gh CLI is not available on self-hosted (meibel-eks-dev) runners.
+          curl -fsSL \
+            -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/meibel-ai/gitops-platform/pulls" \
+            -d "{
+              \"title\": \"promote(${{ inputs.service-name }}): ${{ steps.promote.outputs.short-sha }} to dev\",
+              \"head\": \"${{ steps.promote.outputs.branch }}\",
+              \"base\": \"main\",
+              \"body\": \"Automated promotion from [${{ github.repository }}@${{ github.sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})\n\nImage: \`${{ inputs.registry }}/${{ inputs.service-name }}@${{ steps.build.outputs.digest }}\`\"
+            }"
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
