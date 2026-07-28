@@ -33,6 +33,7 @@
             "confidence-platform",
             "platform-ui",
             "platform-services",
+            "integration-platform",
             "meibel-core"
           ],
           "description": "Owning domain repo. `meibel-core` retained for legacy services until Notion Week 5 archives it."
