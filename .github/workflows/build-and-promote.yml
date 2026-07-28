@@ -464,55 +464,62 @@ jobs:
         run: |
           # Use curl — gh CLI is not available on self-hosted (meibel-eks-dev) runners.
           # PR body follows gitops-platform/.github/pull_request_template.md (DCF-5/76/155).
-          BODY="## Summary
-
-Automated image tag promotion for \`${{ inputs.service-name }}\` to dev overlay.
-
-Source: [${{ github.repository }}@${{ steps.promote.outputs.short-sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
-Image: \`${{ inputs.registry }}/${{ inputs.service-name }}@${{ steps.build.outputs.digest }}\`
-
-## Change Type
-
-- [x] Image tag update (new service version)
-
-## Services Affected
-
-| Service | Change | Environments |
-|---------|--------|-------------|
-| ${{ inputs.service-name }} | Image tag → ${{ steps.promote.outputs.short-sha }} | Dev |
-
-## Environments Affected
-
-- [x] Development only (no prod values or tag changes)
-
-## Pre-Production Testing (DCF-155)
-
-- [x] Dev testing not possible for this change — reason: This PR IS the dev deployment. Validation happens after ArgoCD syncs.
-
-**Validation summary**: Dev overlay updated to ${{ steps.promote.outputs.short-sha }}. Monitor ArgoCD app \`${{ inputs.service-name }}\` for Synced/Healthy status after merge.
-
-## Production Impact
-
-**ArgoCD apps affected**: None — dev only.
-
-**Expected downtime / degradation**: Rolling restart of ${{ inputs.service-name }} in dev.
-
-**Rollback plan**: Revert this PR or re-promote the previous tag.
-
-## Emergency / Hotfix Change (DCF-76)
-
-Not applicable.
-
----
-
-## Reviewer Checklist (DCF-5)
-
-- [ ] I have reviewed the configuration changes
-- [ ] The services and environments affected are accurately described
-- [ ] Dev was tested and evidence is in the Validation summary above — or a clear reason is given why dev testing was not possible (do not approve without one or the other)
-- [ ] A rollback plan is documented
-- [ ] I approve this change for merge"
-
+          # Build body via echo group to avoid YAML literal-block indentation issues with heredocs.
+          SVC="${{ inputs.service-name }}"
+          SHA="${{ steps.promote.outputs.short-sha }}"
+          IMG="${{ inputs.registry }}/${{ inputs.service-name }}@${{ steps.build.outputs.digest }}"
+          REPO="${{ github.repository }}"
+          COMMIT_URL="${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+          {
+            echo "## Summary"
+            echo ""
+            echo "Automated image tag promotion for \`${SVC}\` to dev overlay."
+            echo ""
+            echo "Source: [${REPO}@${SHA}](${COMMIT_URL})"
+            echo "Image: \`${IMG}\`"
+            echo ""
+            echo "## Change Type"
+            echo ""
+            echo "- [x] Image tag update (new service version)"
+            echo ""
+            echo "## Services Affected"
+            echo ""
+            echo "| Service | Change | Environments |"
+            echo "|---------|--------|-------------|"
+            echo "| ${SVC} | Image tag updated to ${SHA} | Dev |"
+            echo ""
+            echo "## Environments Affected"
+            echo ""
+            echo "- [x] Development only (no prod values or tag changes)"
+            echo ""
+            echo "## Pre-Production Testing (DCF-155)"
+            echo ""
+            echo "- [x] Dev testing not possible for this change — reason: This PR IS the dev deployment. Validation happens after ArgoCD syncs."
+            echo ""
+            echo "**Validation summary**: Dev overlay updated to ${SHA}. Monitor ArgoCD app \`${SVC}\` for Synced/Healthy status after merge."
+            echo ""
+            echo "## Production Impact"
+            echo ""
+            echo "**ArgoCD apps affected**: None — dev only."
+            echo ""
+            echo "**Expected downtime / degradation**: Rolling restart of ${SVC} in dev."
+            echo ""
+            echo "**Rollback plan**: Revert this PR or re-promote the previous tag."
+            echo ""
+            echo "## Emergency / Hotfix Change (DCF-76)"
+            echo ""
+            echo "Not applicable."
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Reviewer Checklist (DCF-5)"
+            echo ""
+            echo "- [ ] I have reviewed the configuration changes"
+            echo "- [ ] The services and environments affected are accurately described"
+            echo "- [ ] Dev was tested and evidence is in the Validation summary above — or a clear reason is given why dev testing was not possible (do not approve without one or the other)"
+            echo "- [ ] A rollback plan is documented"
+            echo "- [ ] I approve this change for merge"
+          } > /tmp/pr-body.md
           curl -fsSL \
             -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -520,9 +527,9 @@ Not applicable.
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/meibel-ai/gitops-platform/pulls" \
             -d "$(jq -n \
-              --arg title "promote(${{ inputs.service-name }}): ${{ steps.promote.outputs.short-sha }} to dev" \
+              --arg title "promote(${SVC}): ${SHA} to dev" \
               --arg head "${{ steps.promote.outputs.branch }}" \
-              --arg body "$BODY" \
+              --rawfile body /tmp/pr-body.md \
               '{title: $title, head: $head, base: "main", body: $body}')"
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
