@@ -385,9 +385,12 @@ jobs:
       - name: Update image digest in overlay
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         id: promote
-        working-directory: .
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
+          echo "PWD: $(pwd)"
+          echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
+          ls gitops-platform/apps/workloads/ 2>/dev/null || echo "gitops-platform/apps/workloads/ not found from $(pwd)"
           ENV="${{ inputs.promote-env }}"
           OVERLAY="gitops-platform/apps/workloads/${{ inputs.service-name }}/envs/${ENV}"
           DIGEST="${{ steps.build.outputs.digest }}"
