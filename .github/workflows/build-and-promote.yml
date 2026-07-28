@@ -295,6 +295,7 @@ jobs:
           images: ${{ inputs.registry }}/${{ inputs.service-name }}
           tags: |
             type=sha,format=long
+            type=sha
             type=ref,event=branch
 
       - name: Build and push image
