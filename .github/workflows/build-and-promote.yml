@@ -28,6 +28,14 @@ on:
         required: false
         type: string
         default: 'projects/502352286495/locations/global/workloadIdentityPools/meibel-ai-gh-wd-pool/providers/meibel-ai-gh-wd-pool-provider'
+      gcp-project-id:
+        description: |
+          GCP project ID for the hub (Artifact Registry, Secret Manager). Passed to
+          google-github-actions/auth so it can export CLOUDSDK_CORE_PROJECT, which
+          keyrings.google-artifactregistry-auth requires to resolve the correct registry.
+        required: false
+        type: string
+        default: 'meibel-hub-7049'
       cache-type:
         description: 'Docker build cache backend: gha (default) | registry (GPU repos >10GB)'
         required: false
@@ -139,6 +147,7 @@ jobs:
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           workload_identity_provider: ${{ inputs.wif-provider }}
+          project_id: ${{ inputs.gcp-project-id }}
 
       # ── 2a. Python lint + tests ───────────────────────────────────────────────
       - name: Set up Python
