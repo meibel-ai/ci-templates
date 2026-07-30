@@ -167,16 +167,39 @@ jobs:
             -e POSTGRES_DB=postgres \
             -p 5432:5432 \
             postgres:15
-          # postgresql-client provides the psql binary needed by conftest migrations
-          sudo apt-get install -y -qq postgresql-client 2>/dev/null || \
-            apt-get install -y -qq postgresql-client 2>/dev/null || \
-            echo "::warning::postgresql-client install failed; psql-based migrations may not work"
           # Wait until Postgres is ready to accept connections
           echo "Waiting for Postgres..."
           until docker exec postgres-ci pg_isready -U test_user -q; do
             sleep 2
           done
           echo "Postgres ready."
+          # Create a psql shim using docker exec — avoids needing postgresql-client
+          # on the runner (sudo is blocked on meibel-eks-dev). The shim copies
+          # SQL files into the container with docker cp, then executes psql inside.
+          mkdir -p "$HOME/.local/bin"
+          cat > "$HOME/.local/bin/psql" << 'PSQL_SHIM'
+          #!/bin/sh
+          # Parse args to find -f <file>, pass everything else through to psql inside container.
+          ARGS=""
+          FILE_ARG=""
+          while [ $# -gt 0 ]; do
+            case "$1" in
+              -f) shift; FILE_ARG="$1" ;;
+              *)  ARGS="$ARGS $1" ;;
+            esac
+            shift
+          done
+          if [ -n "$FILE_ARG" ]; then
+            docker cp "$FILE_ARG" postgres-ci:/tmp/_migration.sql
+            docker exec -e PGPASSWORD="${PGPASSWORD:-test_password}" \
+              postgres-ci psql $ARGS -f /tmp/_migration.sql
+          else
+            docker exec -e PGPASSWORD="${PGPASSWORD:-test_password}" \
+              postgres-ci psql $ARGS
+          fi
+          PSQL_SHIM
+          chmod +x "$HOME/.local/bin/psql"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # ── 2b. Python lint + tests ───────────────────────────────────────────────
       - name: Set up Python
