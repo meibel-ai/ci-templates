@@ -116,10 +116,12 @@ jobs:
           SKIP_TESTS=false
           SKIP_LINT=false
           SKIP_TRIVY=false
+          POSTGRES_SERVICE=false
           if [ -f ci-config.yaml ]; then
             grep -qE '^skip-tests:\s+true' ci-config.yaml 2>/dev/null && SKIP_TESTS=true
             grep -qE '^skip-lint:\s+true' ci-config.yaml 2>/dev/null && SKIP_LINT=true
             grep -qE '^skip-trivy:\s+true' ci-config.yaml 2>/dev/null && SKIP_TRIVY=true
+            grep -qE '^postgres-service:\s+true' ci-config.yaml 2>/dev/null && POSTGRES_SERVICE=true
           fi
 
           # Detect whether test files exist so test steps are no-ops on repos with none
@@ -142,6 +144,7 @@ jobs:
           echo "skip-tests=${SKIP_TESTS}" >> "$GITHUB_OUTPUT"
           echo "skip-lint=${SKIP_LINT}" >> "$GITHUB_OUTPUT"
           echo "skip-trivy=${SKIP_TRIVY}" >> "$GITHUB_OUTPUT"
+          echo "postgres-service=${POSTGRES_SERVICE}" >> "$GITHUB_OUTPUT"
           echo "has-tests=${HAS_TESTS}" >> "$GITHUB_OUTPUT"
 
       # ── 2. GCP auth (WIF) — needed by Python for Artifact Registry deps ──────
@@ -151,7 +154,31 @@ jobs:
           workload_identity_provider: ${{ inputs.wif-provider }}
           project_id: ${{ inputs.gcp-project-id }}
 
-      # ── 2a. Python lint + tests ───────────────────────────────────────────────
+      # ── 2a. Postgres service container (opt-in via ci-config.yaml) ──────────────
+      # Start postgres:15 via Docker when postgres-service: true is set in
+      # ci-config.yaml. Installs postgresql-client so conftest.py can apply
+      # migrations via the psql CLI. The container is cleaned up at job end.
+      - name: Start Postgres for integration tests
+        if: inputs.language == 'python' && steps.ci-config.outputs.postgres-service == 'true'
+        run: |
+          docker run -d --name postgres-ci \
+            -e POSTGRES_USER=test_user \
+            -e POSTGRES_PASSWORD=test_password \
+            -e POSTGRES_DB=postgres \
+            -p 5432:5432 \
+            postgres:15
+          # postgresql-client provides the psql binary needed by conftest migrations
+          sudo apt-get install -y -qq postgresql-client 2>/dev/null || \
+            apt-get install -y -qq postgresql-client 2>/dev/null || \
+            echo "::warning::postgresql-client install failed; psql-based migrations may not work"
+          # Wait until Postgres is ready to accept connections
+          echo "Waiting for Postgres..."
+          until docker exec postgres-ci pg_isready -U test_user -q; do
+            sleep 2
+          done
+          echo "Postgres ready."
+
+      # ── 2b. Python lint + tests ───────────────────────────────────────────────
       - name: Set up Python
         if: inputs.language == 'python'
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
