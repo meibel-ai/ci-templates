@@ -36,12 +36,14 @@ name: Prod Intent Reconciliation
 on:
   workflow_call:
     inputs:
-      promote-workflow-name:
+      promote-workflow-file:
         required: true
         type: string
         description: >-
-          The display "name:" (or file name ending in .yml) of the workflow
-          that MUST run when a merged PR declares Production intent.
+          The file name (e.g. "promote-to-prod.yml") of the workflow that
+          MUST run when a merged PR declares Production intent. File path
+          is used rather than display name because workflows may override
+          their run name via `run-name:`, which replaces `name:` in the API.
       wait-seconds:
         required: false
         type: number
@@ -59,7 +61,7 @@ jobs:
       - name: Check intent + promote workflow run
         uses: actions/github-script@v7
         env:
-          PROMOTE_WORKFLOW: ${{ inputs.promote-workflow-name }}
+          PROMOTE_WORKFLOW_FILE: ${{ inputs.promote-workflow-file }}
           WAIT_SECONDS: ${{ inputs.wait-seconds }}
         with:
           script: |
@@ -89,7 +91,8 @@ jobs:
               return;
             }
 
-            core.info(`PR #${pr.number} declares Production intent. Reconciling against workflow "${process.env.PROMOTE_WORKFLOW}".`);
+            const promoteFile = process.env.PROMOTE_WORKFLOW_FILE;
+            core.info(`PR #${pr.number} declares Production intent. Reconciling against workflow file "${promoteFile}".`);
 
             const mergeSha = pr.merge_commit_sha;
             if (!mergeSha) {
@@ -102,21 +105,19 @@ jobs:
             core.info(`Waiting ${process.env.WAIT_SECONDS}s for promote workflow to appear on ${mergeSha}...`);
             await new Promise((r) => setTimeout(r, waitMs));
 
-            // Find workflow runs on the merge SHA. Match by display name or file name.
-            const wantName = process.env.PROMOTE_WORKFLOW;
-            const isFileName = wantName.endsWith(".yml") || wantName.endsWith(".yaml");
-
-            const runsResp = await github.rest.actions.listWorkflowRunsForRepo({
+            // Query runs by workflow file directly. Workflow `run-name:`
+            // overrides the display name in the run's `name` field, so name
+            // matching is unreliable. `workflow_id` accepts the file name
+            // (e.g. "promote-to-prod.yml") and matches on the workflow file.
+            const runsResp = await github.rest.actions.listWorkflowRuns({
               owner,
               repo,
+              workflow_id: promoteFile,
               head_sha: mergeSha,
               per_page: 100,
             });
 
-            const matched = runsResp.data.workflow_runs.filter((r) => {
-              if (isFileName) return (r.path || "").endsWith(wantName);
-              return r.name === wantName;
-            });
+            const matched = runsResp.data.workflow_runs;
 
             if (matched.length > 0) {
               const summary = matched
@@ -130,9 +131,9 @@ jobs:
             const commentBody = [
               `> **Prod intent reconciliation FAILED.**`,
               ``,
-              `PR #${pr.number} declared Production intent (Environments Affected → Production checked), but no run of \`${wantName}\` was found on the merge commit \`${mergeSha}\` within ${process.env.WAIT_SECONDS}s.`,
+              `PR #${pr.number} declared Production intent (Environments Affected → Production checked), but no run of \`${promoteFile}\` was found on the merge commit \`${mergeSha}\` within ${process.env.WAIT_SECONDS}s.`,
               ``,
-              `**Why this happens:** the PR's diff did not touch any of \`${wantName}\`'s trigger paths, so the workflow was never scheduled. The \`<service>/v1\` tag will not move and ArgoCD will not sync prod for this change.`,
+              `**Why this happens:** the PR's diff did not touch any of \`${promoteFile}\`'s trigger paths, so the workflow was never scheduled. The \`<service>/v1\` tag will not move and ArgoCD will not sync prod for this change.`,
               ``,
               `**How to fix:** open a promotion-marker PR that touches a triggering path (typically \`apps/workloads/<svc>/envs/prod/values.yaml\` in gitops-platform, or \`<svc>/values-prod.yaml\` in manifests) with a comment referencing this PR. On merge, the promote workflow fires and moves the tag forward past this PR.`,
               ``,
@@ -147,5 +148,5 @@ jobs:
             });
 
             core.setFailed(
-              `PR #${pr.number} declared Production intent but no "${wantName}" run fired on merge SHA ${mergeSha}. See PR comment for remediation.`
+              `PR #${pr.number} declared Production intent but no "${promoteFile}" run fired on merge SHA ${mergeSha}. See PR comment for remediation.`
             );
