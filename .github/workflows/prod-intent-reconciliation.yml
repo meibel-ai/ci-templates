@@ -1,0 +1,151 @@
+name: Prod Intent Reconciliation
+
+# Reusable workflow. Caller pattern (see gitops-platform, manifests):
+#
+#   on:
+#     pull_request:
+#       types: [closed]
+#       branches: [main]
+#
+#   jobs:
+#     reconcile:
+#       if: github.event.pull_request.merged == true
+#       uses: meibel-ai/ci-templates/.github/workflows/prod-intent-reconciliation.yml@v1
+#       with:
+#         promote-workflow-name: "Promote Workloads to Production"
+#       permissions:
+#         contents: read
+#         pull-requests: write
+#         actions: read
+#
+# What it catches:
+#   A merged PR whose body declares Production intent (Environments Affected
+#   checkbox) but whose diff misses every trigger path of the promote workflow.
+#   That mismatch means the tag never moves and prod never syncs — the exact
+#   "silent prod miss" failure mode. This workflow fails LOUDLY (comment on
+#   the PR + non-zero exit) when it happens; a human then opens a marker PR
+#   to fire the promote workflow.
+#
+# What it does NOT catch:
+#   - PRs whose body has Production unchecked when it should be checked
+#     (that's a body-vs-diff mismatch; prod-pr-compliance-gate.yml covers
+#     the case where the diff touches prod paths).
+#   - Direct-to-main pushes (no PR = no intent declaration to reconcile
+#     against). The compliance gate on push handles that surface.
+
+on:
+  workflow_call:
+    inputs:
+      promote-workflow-name:
+        required: true
+        type: string
+        description: >-
+          The display "name:" (or file name ending in .yml) of the workflow
+          that MUST run when a merged PR declares Production intent.
+      wait-seconds:
+        required: false
+        type: number
+        default: 180
+        description: >-
+          Seconds to wait after merge for the promote workflow to appear on
+          the merge SHA. GitHub's push-event dispatch is normally within 60s;
+          180s is a comfortable margin.
+
+jobs:
+  reconcile:
+    name: Reconcile prod intent vs promote workflow
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check intent + promote workflow run
+        uses: actions/github-script@v7
+        env:
+          PROMOTE_WORKFLOW: ${{ inputs.promote-workflow-name }}
+          WAIT_SECONDS: ${{ inputs.wait-seconds }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+
+            if (!pr || !pr.merged) {
+              core.info("PR is not merged; nothing to reconcile.");
+              return;
+            }
+
+            const body = pr.body || "";
+
+            // Detect the DCF "Environments Affected" -> Production checkbox.
+            // Matches both `- [x] **Production**` and `- [x] Production`,
+            // case-insensitive. Only inside the Environments Affected section.
+            const envSectionMatch = body.match(
+              /##\s+Environments Affected\s*\n([\s\S]*?)(?=\n##\s+|$)/i
+            );
+            if (!envSectionMatch) {
+              core.info("PR body has no 'Environments Affected' section — assuming dev-only.");
+              return;
+            }
+            const productionChecked = /- \[[xX]\]\s*(?:\*\*)?Production(?:\*\*)?/i.test(envSectionMatch[1]);
+            if (!productionChecked) {
+              core.info("Production not checked in Environments Affected — this was a dev PR. Nothing owed.");
+              return;
+            }
+
+            core.info(`PR #${pr.number} declares Production intent. Reconciling against workflow "${process.env.PROMOTE_WORKFLOW}".`);
+
+            const mergeSha = pr.merge_commit_sha;
+            if (!mergeSha) {
+              core.setFailed(`PR #${pr.number} is marked merged but has no merge_commit_sha — cannot reconcile.`);
+              return;
+            }
+
+            // Wait for GitHub to enqueue the merge-triggered workflow runs.
+            const waitMs = Number(process.env.WAIT_SECONDS) * 1000;
+            core.info(`Waiting ${process.env.WAIT_SECONDS}s for promote workflow to appear on ${mergeSha}...`);
+            await new Promise((r) => setTimeout(r, waitMs));
+
+            // Find workflow runs on the merge SHA. Match by display name or file name.
+            const wantName = process.env.PROMOTE_WORKFLOW;
+            const isFileName = wantName.endsWith(".yml") || wantName.endsWith(".yaml");
+
+            const runsResp = await github.rest.actions.listWorkflowRunsForRepo({
+              owner,
+              repo,
+              head_sha: mergeSha,
+              per_page: 100,
+            });
+
+            const matched = runsResp.data.workflow_runs.filter((r) => {
+              if (isFileName) return (r.path || "").endsWith(wantName);
+              return r.name === wantName;
+            });
+
+            if (matched.length > 0) {
+              const summary = matched
+                .map((r) => `- ${r.name} (${r.status}/${r.conclusion || "in-progress"}) — ${r.html_url}`)
+                .join("\n");
+              core.info(`Reconciliation clean. Matching runs on merge SHA:\n${summary}`);
+              return;
+            }
+
+            // Silent prod miss: intent declared, no promote workflow fired.
+            const commentBody = [
+              `> **Prod intent reconciliation FAILED.**`,
+              ``,
+              `PR #${pr.number} declared Production intent (Environments Affected → Production checked), but no run of \`${wantName}\` was found on the merge commit \`${mergeSha}\` within ${process.env.WAIT_SECONDS}s.`,
+              ``,
+              `**Why this happens:** the PR's diff did not touch any of \`${wantName}\`'s trigger paths, so the workflow was never scheduled. The \`<service>/v1\` tag will not move and ArgoCD will not sync prod for this change.`,
+              ``,
+              `**How to fix:** open a promotion-marker PR that touches a triggering path (typically \`apps/workloads/<svc>/envs/prod/values.yaml\` in gitops-platform, or \`<svc>/values-prod.yaml\` in manifests) with a comment referencing this PR. On merge, the promote workflow fires and moves the tag forward past this PR.`,
+              ``,
+              `<sub>Emitted by the shared prod-intent-reconciliation workflow (ci-templates).</sub>`,
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: pr.number,
+              body: commentBody,
+            });
+
+            core.setFailed(
+              `PR #${pr.number} declared Production intent but no "${wantName}" run fired on merge SHA ${mergeSha}. See PR comment for remediation.`
+            );
