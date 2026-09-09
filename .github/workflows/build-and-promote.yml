@@ -60,6 +60,17 @@ on:
         required: false
         type: string
         default: 'dev'
+      promote-values-file:
+        description: |
+          Optional explicit path (relative to repo root, gitops-platform repo)
+          to a Helm values file to update with .image.tag/.image.digest.
+          Overrides the default apps/workloads/<name>/envs/<env>/ overlay
+          auto-detection — used by layouts that don't follow it, e.g. MCP
+          servers: apps/mcp/envs/<env>/<name>.values.yaml.
+          Requires ci-templates v1.1.0+.
+        required: false
+        type: string
+        default: ''
     secrets:
       MEIBEL_DEPLOY_APP_ID:
         required: true
@@ -447,33 +458,46 @@ jobs:
           # Use absolute path — relative "gitops-platform/" fails when defaults.run.working-directory
           # is set to services/<name> (domain-repo layout). Absolute path is unambiguous.
           ENV="${{ inputs.promote-env }}"
-          OVERLAY="${GITHUB_WORKSPACE}/gitops-platform/apps/workloads/${{ inputs.service-name }}/envs/${ENV}"
           DIGEST="${{ steps.build.outputs.digest }}"
           SHORT_SHA="sha-$(echo '${{ github.sha }}' | cut -c1-7)"
           BRANCH="promote/${{ inputs.service-name }}/${SHORT_SHA}"
 
-          if [ ! -d "$OVERLAY" ]; then
-            echo "ERROR: Overlay path $OVERLAY does not exist." >&2
-            echo "Expected either:" >&2
-            echo "  - apps/workloads/${{ inputs.service-name }}/envs/${ENV}/kustomization.yaml (kustomize)" >&2
-            echo "  - apps/workloads/${{ inputs.service-name }}/envs/${ENV}/values.yaml (Helm)" >&2
-            exit 1
-          fi
-
-          KUST_FILE="${OVERLAY}/kustomization.yaml"
-          VALUES_FILE="${OVERLAY}/values.yaml"
-
-          # Detect layout
-          if [ -f "$KUST_FILE" ]; then
-              LAYOUT="kustomize"
-              TARGET_FILE="$KUST_FILE"
-          elif [ -f "$VALUES_FILE" ]; then
+          # v1.5.0: explicit values-file override (e.g. MCP servers at
+          # apps/mcp/envs/<env>/<name>.values.yaml). Helm layout, direct yq update.
+          if [ -n "${{ inputs.promote-values-file }}" ]; then
+              TARGET_FILE="${GITHUB_WORKSPACE}/gitops-platform/${{ inputs.promote-values-file }}"
+              if [ ! -f "$TARGET_FILE" ]; then
+                  echo "ERROR: promote-values-file not found: $TARGET_FILE" >&2
+                  exit 1
+              fi
               LAYOUT="helm"
-              TARGET_FILE="$VALUES_FILE"
           else
-              echo "ERROR: neither kustomization.yaml nor values.yaml found under $OVERLAY" >&2
-              ls -la "$OVERLAY" >&2 || true
-              exit 1
+              OVERLAY="${GITHUB_WORKSPACE}/gitops-platform/apps/workloads/${{ inputs.service-name }}/envs/${ENV}"
+
+              if [ ! -d "$OVERLAY" ]; then
+                echo "ERROR: Overlay path $OVERLAY does not exist." >&2
+                echo "Expected either:" >&2
+                echo "  - apps/workloads/${{ inputs.service-name }}/envs/${ENV}/kustomization.yaml (kustomize)" >&2
+                echo "  - apps/workloads/${{ inputs.service-name }}/envs/${ENV}/values.yaml (Helm)" >&2
+                echo "  - or set promote-values-file for non-workload layouts" >&2
+                exit 1
+              fi
+
+              KUST_FILE="${OVERLAY}/kustomization.yaml"
+              VALUES_FILE="${OVERLAY}/values.yaml"
+
+              # Detect layout
+              if [ -f "$KUST_FILE" ]; then
+                  LAYOUT="kustomize"
+                  TARGET_FILE="$KUST_FILE"
+              elif [ -f "$VALUES_FILE" ]; then
+                  LAYOUT="helm"
+                  TARGET_FILE="$VALUES_FILE"
+              else
+                  echo "ERROR: neither kustomization.yaml nor values.yaml found under $OVERLAY" >&2
+                  ls -la "$OVERLAY" >&2 || true
+                  exit 1
+              fi
           fi
           echo "Detected layout: $LAYOUT — updating $TARGET_FILE"
 
@@ -482,7 +506,11 @@ jobs:
           git config user.email "meibel-deploy[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
 
-          REL_TARGET="apps/workloads/${{ inputs.service-name }}/envs/${ENV}/$(basename "$TARGET_FILE")"
+          if [ -n "${{ inputs.promote-values-file }}" ]; then
+              REL_TARGET="${{ inputs.promote-values-file }}"
+          else
+              REL_TARGET="apps/workloads/${{ inputs.service-name }}/envs/${ENV}/$(basename "$TARGET_FILE")"
+          fi
 
           case "$LAYOUT" in
             kustomize)
