@@ -524,8 +524,14 @@ jobs:
                 echo "yq not found — installing pinned binary"
                 curl -fsSL -o /tmp/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
                 chmod +x /tmp/yq
-                # sudo may be blocked in container environments; fall back to $HOME/.local/bin
-                (sudo mv /tmp/yq /usr/local/bin/yq 2>/dev/null) || (mkdir -p "$HOME/.local/bin" && mv /tmp/yq "$HOME/.local/bin/yq" && export PATH="$HOME/.local/bin:$PATH")
+                # sudo is unavailable in the arc-runner containers. Install to
+                # $HOME/.local/bin — no subshell here: a previous version ran the
+                # export inside ( ... ) so PATH never propagated and the promote
+                # step failed with "yq: command not found" (exit 127) on any
+                # runner without a preinstalled yq.
+                mkdir -p "$HOME/.local/bin"
+                mv /tmp/yq "$HOME/.local/bin/yq"
+                export PATH="$HOME/.local/bin:$PATH"
               fi
               yq -i ".image.tag = \"${SHORT_SHA}\"" "$REL_TARGET"
               yq -i ".image.digest = \"${DIGEST}\"" "$REL_TARGET"
