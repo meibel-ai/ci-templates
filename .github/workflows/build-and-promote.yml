@@ -53,6 +53,39 @@ on:
         required: false
         type: string
         default: '.'
+      docker-context:
+        description: |
+          Optional repo-relative Docker build context. Default: service-path.
+          Set '.' for apps in a JS workspace whose image needs the repository
+          root (shared libs, the root lockfile), together with `dockerfile`.
+        required: false
+        type: string
+        default: ''
+      dockerfile:
+        description: |
+          Optional repo-relative path to the Dockerfile.
+          Default: <service-path>/Dockerfile (unchanged behaviour).
+        required: false
+        type: string
+        default: ''
+      node-package-manager:
+        description: |
+          Node only: 'npm' (default, unchanged behaviour: npm ci, eslint and
+          npm test in service-path) or 'pnpm' for apps in a pnpm workspace:
+          pnpm (via corepack, from the root package.json packageManager field)
+          installs once at node-workspace-root with --frozen-lockfile, the
+          service's workspace dependencies are built, then the service's own
+          lint and test scripts run.
+        required: false
+        type: string
+        default: 'npm'
+      node-workspace-root:
+        description: |
+          Node + pnpm only: repo-relative directory holding pnpm-workspace.yaml
+          and pnpm-lock.yaml. Default: '.'.
+        required: false
+        type: string
+        default: '.'
       promote-env:
         description: |
           Target env overlay for the promotion PR (gitops-platform
@@ -142,7 +175,12 @@ jobs:
               [ -z "$(find . -name 'test_*.py' -o -name '*_test.py' 2>/dev/null | head -1)" ] && HAS_TESTS=false
               ;;
             node)
-              [ -z "$(find . -name '*.test.js' -o -name '*.test.ts' -o -name '*.spec.js' -o -name '*.spec.ts' 2>/dev/null | head -1)" ] && HAS_TESTS=false
+              if [ "${{ inputs.node-package-manager }}" = "pnpm" ]; then
+                # Workspace packages say how they test: a "test" script in package.json.
+                node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.test ? 0 : 1)" || HAS_TESTS=false
+              else
+                [ -z "$(find . -name '*.test.js' -o -name '*.test.ts' -o -name '*.spec.js' -o -name '*.spec.ts' 2>/dev/null | head -1)" ] && HAS_TESTS=false
+              fi
               ;;
             go)
               [ -z "$(find . -name '*_test.go' 2>/dev/null | head -1)" ] && HAS_TESTS=false
@@ -260,27 +298,76 @@ jobs:
         run: poetry run pytest tests/ -v --tb=short
 
       # ── 2b. Node lint + tests ─────────────────────────────────────────────────
-      - name: Set up Node
+      - name: Validate node-package-manager input
         if: inputs.language == 'node'
+        working-directory: .
+        run: |
+          case "${{ inputs.node-package-manager }}" in
+            npm|pnpm) ;;
+            *) echo "ERROR: node-package-manager must be 'npm' or 'pnpm', got '${{ inputs.node-package-manager }}'" >&2; exit 1 ;;
+          esac
+
+      - name: Set up Node
+        if: inputs.language == 'node' && inputs.node-package-manager == 'npm'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
           cache: 'npm'
 
       - name: Install Node dependencies
-        if: inputs.language == 'node'
+        if: inputs.language == 'node' && inputs.node-package-manager == 'npm'
         run: npm ci
 
       - name: Node lint (eslint)
-        if: inputs.language == 'node'
+        if: inputs.language == 'node' && inputs.node-package-manager == 'npm'
         run: npx eslint .
 
       - name: Node tests
         if: |
-          inputs.language == 'node' &&
+          inputs.language == 'node' && inputs.node-package-manager == 'npm' &&
           steps.ci-config.outputs.skip-tests != 'true' &&
           steps.ci-config.outputs.has-tests == 'true'
         run: npm test
+
+      # pnpm workspace: install once at the workspace root, build the service's
+      # workspace dependencies, then run the service's own lint and test scripts.
+      - name: Set up Node (pnpm workspace)
+        if: inputs.language == 'node' && inputs.node-package-manager == 'pnpm'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+
+      - name: Enable pnpm (corepack)
+        if: inputs.language == 'node' && inputs.node-package-manager == 'pnpm'
+        working-directory: ${{ inputs.node-workspace-root }}
+        run: |
+          corepack enable
+          pnpm --version
+
+      - name: Install Node dependencies (pnpm workspace)
+        if: inputs.language == 'node' && inputs.node-package-manager == 'pnpm'
+        working-directory: ${{ inputs.node-workspace-root }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace dependencies (pnpm workspace)
+        if: inputs.language == 'node' && inputs.node-package-manager == 'pnpm'
+        run: |
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          # "<name>^..." selects the packages this one depends on, not the package itself.
+          pnpm --filter "${PACKAGE_NAME}^..." run --if-present build
+
+      - name: Node lint (pnpm workspace)
+        if: |
+          inputs.language == 'node' && inputs.node-package-manager == 'pnpm' &&
+          steps.ci-config.outputs.skip-lint != 'true'
+        run: pnpm run --if-present lint
+
+      - name: Node tests (pnpm workspace)
+        if: |
+          inputs.language == 'node' && inputs.node-package-manager == 'pnpm' &&
+          steps.ci-config.outputs.skip-tests != 'true' &&
+          steps.ci-config.outputs.has-tests == 'true'
+        run: pnpm test
 
       # ── 2c. Go lint + tests ───────────────────────────────────────────────────
       - name: Set up Go
@@ -363,7 +450,8 @@ jobs:
         id: build
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
-          context: ${{ inputs.service-path }}
+          context: ${{ inputs.docker-context != '' && inputs.docker-context || inputs.service-path }}
+          file: ${{ inputs.dockerfile != '' && inputs.dockerfile || format('{0}/Dockerfile', inputs.service-path) }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
