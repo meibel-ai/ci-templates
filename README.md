@@ -45,6 +45,10 @@ jobs:
 | `registry` | no | `ghcr.io/meibel-ai` | Container registry prefix |
 | `wif-provider` | no | core pool | Full WIF provider path. Override for hub-pool GPU services. |
 | `cache-type` | no | `gha` | Use `registry` for GPU repos where images exceed 10GB GHA cache limit |
+| `docker-context` | no | `service-path` | Docker build context. Set `.` for apps in a JS workspace whose image needs the repository root (shared libs, the root lockfile). |
+| `dockerfile` | no | `<service-path>/Dockerfile` | Dockerfile path, relative to the repository root. |
+| `node-package-manager` | no | `npm` | `npm` (unchanged) or `pnpm` for apps in a pnpm workspace: corepack pnpm, `pnpm install --frozen-lockfile` at `node-workspace-root`, build the service's workspace dependencies, then the service's `lint` and `test` scripts. |
+| `node-workspace-root` | no | `.` | pnpm only: directory with `pnpm-workspace.yaml` and `pnpm-lock.yaml`. |
 
 ## WIF pools
 
@@ -65,3 +69,21 @@ Kyverno `verifyImages` policy must reference this path.
 
 The gitops-platform promote step requires WS-D1 (directory restructure) to be complete.
 The overlay path it writes to: `apps/workloads/{service-name}/envs/dev/kustomization.yaml`
+
+## pnpm workspace apps
+
+For an app in a pnpm workspace (for example `platform-ui/services/nexus-web`), build the image from the repository root:
+
+```yaml
+uses: meibel-ai/ci-templates/.github/workflows/build-and-promote.yml@v1
+with:
+  service-name: nexus-web
+  language: node
+  service-path: services/nexus-web
+  node-package-manager: pnpm
+  docker-context: .
+  dockerfile: services/nexus-web/Dockerfile
+```
+
+The app's Dockerfile prunes the workspace to the app (`turbo prune <package> --docker`) and installs from the pruned lockfile. The root `package.json` sets `packageManager` (for example `pnpm@9.15.0`), which corepack uses.
+
