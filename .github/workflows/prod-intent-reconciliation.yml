@@ -26,6 +26,15 @@ name: Prod Intent Reconciliation
 #   the PR + non-zero exit) when it happens; a human then opens a marker PR
 #   to fire the promote workflow.
 #
+# Deployed-on-merge exemption (deployed-on-merge-paths input): some prod
+# deploys happen on merge itself — root-app ApplicationSets and HEAD-tracked
+# platform workloads (e.g. gitops-platform environments/hub/** and
+# infra/platform/**, the metering/opsvis hub model). For a PR whose diff
+# includes such a path, no promote run is owed; reconciliation passes and
+# comments "deployed-on-merge" so the audit trail explains the absence of a
+# promote run. Without this, hub platform PRs fail loudly and the marker-PR
+# remediation they get would move an unrelated service's v1 tag.
+#
 # What it does NOT catch:
 #   - PRs whose body has Production unchecked when it should be checked
 #     (that's a body-vs-diff mismatch; prod-pr-compliance-gate.yml covers
@@ -52,6 +61,18 @@ on:
           Seconds to wait after merge for the promote workflow to appear on
           the merge SHA. GitHub's push-event dispatch is normally within 60s;
           180s is a comfortable margin.
+      deployed-on-merge-paths:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Newline-separated glob patterns ('**' crosses '/', '*' does not)
+          for paths whose prod deploy happens on merge itself (root-app
+          ApplicationSet / HEAD-tracked app) rather than via the promote
+          workflow's tag move. When no promote run fired and at least one
+          changed file matches, reconciliation passes as a
+          deployed-on-merge change instead of failing. Leave empty to keep
+          the strict behavior.
 
 jobs:
   reconcile:
@@ -63,6 +84,7 @@ jobs:
         env:
           PROMOTE_WORKFLOW_FILE: ${{ inputs.promote-workflow-file }}
           WAIT_SECONDS: ${{ inputs.wait-seconds }}
+          DEPLOYED_ON_MERGE_PATHS: ${{ inputs.deployed-on-merge-paths }}
         with:
           script: |
             const { owner, repo } = context.repo;
@@ -125,6 +147,64 @@ jobs:
                 .join("\n");
               core.info(`Reconciliation clean. Matching runs on merge SHA:\n${summary}`);
               return;
+            }
+
+            // Deployed-on-merge exemption: some prod deploys happen on merge
+            // itself (root-app ApplicationSets, HEAD-tracked platform
+            // workloads) — no promote-workflow run is owed for those.
+            const exemptPatterns = (process.env.DEPLOYED_ON_MERGE_PATHS || "")
+              .split("\n")
+              .map((s) => s.trim())
+              .filter(Boolean);
+            if (exemptPatterns.length > 0) {
+              const globToRegExp = (pattern) => {
+                let re = "";
+                for (let i = 0; i < pattern.length; i++) {
+                  const c = pattern[i];
+                  if (c === "*") {
+                    if (pattern[i + 1] === "*") {
+                      i++;
+                      if (pattern[i + 1] === "/") i++;
+                      re += ".*";
+                    } else {
+                      re += "[^/]*";
+                    }
+                  } else if ("\\^$.|?+()[]{}".includes(c)) {
+                    re += "\\" + c;
+                  } else {
+                    re += c;
+                  }
+                }
+                return new RegExp("^" + re + "$");
+              };
+              const patterns = exemptPatterns.map(globToRegExp);
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner,
+                repo,
+                pull_number: pr.number,
+                per_page: 100,
+              });
+              const exemptMatch = files
+                .map((f) => f.filename)
+                .find((name) => patterns.some((re) => re.test(name)));
+              if (exemptMatch) {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  body: [
+                    `> **Prod intent reconciliation PASSED (deployed-on-merge).**`,
+                    ``,
+                    `No \`${promoteFile}\` run is owed for merge commit \`${mergeSha}\`: \`${exemptMatch}\` deploys to prod on merge itself (root app / HEAD-tracked app), not via the promote workflow's tag move.`,
+                    ``,
+                    `<sub>Emitted by the shared prod-intent-reconciliation workflow (ci-templates).</sub>`,
+                  ].join("\n"),
+                });
+                core.info(
+                  `Reconciliation clean (deployed-on-merge): ${exemptMatch} deploys on merge; no ${promoteFile} run owed for ${mergeSha}.`
+                );
+                return;
+              }
             }
 
             // Silent prod miss: intent declared, no promote workflow fired.
